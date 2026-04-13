@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test -d backend)",
+      "Bash(test -d mcp)",
+      "Bash(test -d frontend)",
+      "Bash(test -f docker-compose.yaml)",
+      "Bash(test -d backend/tests)",
+      "Bash(test -f pytest.ini)",
+      "Bash(test -f backend/pytest.ini)",
+      "Bash(find backend/app -name \"*.py\" -exec grep -l \"def.*->\" {})",
+      "Bash(test -f .env)",
+      "Bash(git init)",
+      "Bash(git config user.name \"Emanuele Travanti\")",
+      "Bash(git config user.email \"emanuele.travanti@example.com\")",
+      "Bash(git add .)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
