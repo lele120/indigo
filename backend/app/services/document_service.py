@@ -1,10 +1,10 @@
 """
 Document CRUD operations
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 from uuid import UUID
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, desc
+from sqlalchemy import func, or_, desc, case
 import hashlib
 
 from app.models.document import Document, Tag, UploadTask
@@ -177,3 +177,31 @@ class DocumentService:
     def check_duplicate(db: Session, file_hash: str) -> Optional[Document]:
         """Check if document with same hash already exists"""
         return db.query(Document).filter(Document.file_hash == file_hash).first()
+
+    @staticmethod
+    def get_stats(db: Session) -> Dict[str, any]:
+        """
+        Get document statistics with a single optimized query
+        Returns counts by status and list of all tag names
+        """
+        # Single query to get all counts by status using CASE expressions
+        result = db.query(
+            func.count(Document.id).label('total'),
+            func.sum(case((Document.status == 'pending', 1), else_=0)).label('pending'),
+            func.sum(case((Document.status == 'processing', 1), else_=0)).label('processing'),
+            func.sum(case((Document.status == 'completed', 1), else_=0)).label('completed'),
+            func.sum(case((Document.status == 'failed', 1), else_=0)).label('failed'),
+        ).first()
+
+        # Get all unique tag names
+        tags = db.query(Tag.name).order_by(Tag.name).all()
+        tag_names = [tag[0] for tag in tags]
+
+        return {
+            'total': result.total or 0,
+            'pending': result.pending or 0,
+            'processing': result.processing or 0,
+            'completed': result.completed or 0,
+            'failed': result.failed or 0,
+            'tags': tag_names,
+        }

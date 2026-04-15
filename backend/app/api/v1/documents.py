@@ -20,6 +20,7 @@ from app.schemas.document import (
     UploadTaskResponse,
     FileUploadResponse,
     DocumentCreate,
+    DocumentStatsResponse,
 )
 from app.tasks.document_tasks import process_document
 
@@ -324,3 +325,20 @@ def list_tags(db: Session = Depends(get_db)):
     """
     tags = DocumentService.get_all_tags(db)
     return tags
+
+
+@router.get("/stats", response_model=DocumentStatsResponse)
+def get_statistics(db: Session = Depends(get_db)):
+    """
+    Get document statistics
+
+    Returns aggregated statistics including:
+    - Total document count
+    - Count by status (pending, processing, completed, failed)
+    - List of all unique tags
+
+    This endpoint uses an optimized query with a single database call
+    instead of multiple queries, providing much faster response times.
+    """
+    stats = DocumentService.get_stats(db)
+    return DocumentStatsResponse(**stats)

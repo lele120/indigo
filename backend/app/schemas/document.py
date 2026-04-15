@@ -90,3 +90,14 @@ class FileUploadResponse(BaseModel):
     document_id: UUID
     task_id: UUID
     message: str
+
+
+# Document statistics schema
+class DocumentStatsResponse(BaseModel):
+    """Schema for document statistics"""
+    total: int = Field(..., description="Total number of documents")
+    pending: int = Field(..., description="Number of pending documents")
+    processing: int = Field(..., description="Number of processing documents")
+    completed: int = Field(..., description="Number of completed documents")
+    failed: int = Field(..., description="Number of failed documents")
+    tags: List[str] = Field(..., description="List of all unique tag names")

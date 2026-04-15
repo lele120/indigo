@@ -100,21 +100,8 @@ class ApiClient {
 
   // Stats
   async getStats(): Promise<DocumentStats> {
-    const allDocs = await this.listDocuments({ page: 1, page_size: 1 })
-    const pending = await this.listDocuments({ page: 1, page_size: 1, status: 'pending' })
-    const processing = await this.listDocuments({ page: 1, page_size: 1, status: 'processing' })
-    const completed = await this.listDocuments({ page: 1, page_size: 1, status: 'completed' })
-    const failed = await this.listDocuments({ page: 1, page_size: 1, status: 'failed' })
-    const tags = await this.getAllTags()
-
-    return {
-      total: allDocs.total,
-      pending: pending.total,
-      processing: processing.total,
-      completed: completed.total,
-      failed: failed.total,
-      tags: tags.map((t) => t.name),
-    }
+    const { data } = await this.client.get('/documents/stats')
+    return data
   }
 
   // Health check
