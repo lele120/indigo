@@ -8,41 +8,41 @@ RAG (Retrieval-Augmented Generation) system with MCP (Model Context Protocol) se
 
 ```mermaid
 graph TB
-    subgraph "Client Layer"
-        Browser[Browser<br/>React Frontend]
-        MCPClient[MCP Client<br/>Claude/AI Agent]
+    subgraph Client["Client Layer"]
+        Browser["Browser<br>React Frontend"]
+        MCPClient["MCP Client<br>Claude/AI Agent"]
     end
 
-    subgraph "Application Layer"
-        Frontend[Frontend Container<br/>Nginx + React]
-        Backend[Backend API<br/>FastAPI :8000]
-        MCP[MCP Server<br/>FastMCP :8001]
-        Celery[Celery Worker<br/>Background Tasks]
+    subgraph Application["Application Layer"]
+        Frontend["Frontend Container<br>Nginx + React"]
+        Backend["Backend API<br>FastAPI :8000"]
+        MCP["MCP Server<br>FastMCP :8001"]
+        Celery["Celery Worker<br>Background Tasks"]
     end
 
-    subgraph "Data Layer"
-        Postgres[(PostgreSQL 16<br/>Metadata)]
-        Redis[(Redis 7<br/>Cache + Queue)]
-        Qdrant[(Qdrant 1.17<br/>Vectors)]
+    subgraph Data["Data Layer"]
+        Postgres[("PostgreSQL 16<br>Metadata")]
+        Redis[("Redis 7<br>Cache + Queue")]
+        Qdrant[("Qdrant 1.17<br>Vectors")]
     end
 
-    subgraph "Monitoring"
-        Prometheus[Prometheus<br/>Metrics]
+    subgraph Monitoring["Monitoring"]
+        Prometheus["Prometheus<br>Metrics"]
     end
 
-    Browser -->|HTTP :3000| Frontend
-    MCPClient -->|Streamable HTTP :8001| MCP
-    Frontend -->|/api proxy| Backend
-    MCP -->|REST API| Backend
+    Browser -->|"HTTP :3000"| Frontend
+    MCPClient -->|"Streamable HTTP :8001"| MCP
+    Frontend -->|"/api proxy"| Backend
+    MCP -->|"REST API"| Backend
     Backend -->|SQL| Postgres
     Backend -->|Cache| Redis
-    Backend -->|gRPC :6334| Qdrant
-    Backend -->|Queue Task| Redis
-    Celery -->|Poll Tasks| Redis
-    Celery -->|Store Chunks| Postgres
-    Celery -->|Upsert Vectors| Qdrant
-    Backend -.->|Scrape /metrics| Prometheus
-    MCP -.->|Scrape /metrics| Prometheus
+    Backend -->|"gRPC :6334"| Qdrant
+    Backend -->|"Queue Task"| Redis
+    Celery -->|"Poll Tasks"| Redis
+    Celery -->|"Store Chunks"| Postgres
+    Celery -->|"Upsert Vectors"| Qdrant
+    Backend -.->|"Scrape /metrics"| Prometheus
+    MCP -.->|"Scrape /metrics"| Prometheus
 
     classDef client fill:#e1f5ff,stroke:#01579b,stroke-width:2px
     classDef app fill:#fff3e0,stroke:#e65100,stroke-width:2px
