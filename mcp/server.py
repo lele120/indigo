@@ -543,9 +543,9 @@ def get_stats() -> str:
 
         # Get all tags
         response = make_backend_request("get", "/api/v1/documents/tags/all")
-        tags_data = response.json()
-        stats["total_tags"] = len(tags_data.get("tags", []))
-        stats["tags"] = tags_data.get("tags", [])
+        tags_data = response.json()  # Returns list directly
+        stats["total_tags"] = len(tags_data)
+        stats["tags"] = [tag.get("name") for tag in tags_data]
 
         logger.info(f"{operation}_success", total_documents=stats["total_documents"])
         return json.dumps(stats, indent=2)
