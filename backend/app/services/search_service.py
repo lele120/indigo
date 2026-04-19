@@ -277,19 +277,29 @@ class SearchService:
                 return []
 
             # Prepare corpus for BM25
+            # Strip Markdown syntax for better keyword matching
+            from app.services.pdf_service import PDFService
+            import re
+
             corpus = []
             chunk_map = {}
             for i, chunk in enumerate(chunks):
                 # Use full text if available, otherwise use preview
                 text = chunk.text or chunk.text_preview or ""
-                corpus.append(text.lower().split())
+
+                # Strip Markdown syntax for BM25 indexing
+                plain_text = PDFService.strip_markdown_syntax(text)
+
+                # Tokenize using regex to extract only words (alphanumeric)
+                tokens = re.findall(r'\b\w+\b', plain_text.lower())
+                corpus.append(tokens)
                 chunk_map[i] = chunk
 
             # Create BM25 index
             bm25 = BM25Okapi(corpus)
 
-            # Tokenize query
-            query_tokens = query.lower().split()
+            # Tokenize query (same way as corpus: alphanumeric words only)
+            query_tokens = re.findall(r'\b\w+\b', query.lower())
 
             # Get BM25 scores
             scores = bm25.get_scores(query_tokens)

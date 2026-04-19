@@ -96,7 +96,15 @@ def search_documents(
 
         if cached_results:
             logger.info("search_cache_hit", query=request.query)
-            return SearchResponse(**cached_results)
+            # Convert cached dict results back to SearchResult objects
+            results_list = [SearchResult(**r) for r in cached_results.get("results", [])]
+            return SearchResponse(
+                query=cached_results["query"],
+                results=results_list,
+                total=cached_results["total"],
+                use_hybrid=cached_results["use_hybrid"],
+                search_time_ms=cached_results.get("search_time_ms"),
+            )
 
     # Initialize search service
     search_service = SearchService(db)

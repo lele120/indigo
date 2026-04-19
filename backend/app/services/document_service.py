@@ -4,7 +4,7 @@ Document CRUD operations
 from typing import List, Optional, Dict
 from uuid import UUID
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, desc, case
+from sqlalchemy import func, desc, case
 import hashlib
 
 from app.models.document import Document, Tag, UploadTask

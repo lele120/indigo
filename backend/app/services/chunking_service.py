@@ -133,10 +133,12 @@ class ChunkingService:
         self, chunk_text: str, pages_data: List[Dict], page_number: int
     ) -> str:
         """
-        Find the most relevant section heading for a chunk
+        Find the most relevant section heading for a chunk.
+
+        For Markdown text, extracts the first heading that appears in the chunk.
 
         Args:
-            chunk_text: The text of the chunk
+            chunk_text: The text of the chunk (may be Markdown)
             pages_data: List of page data with headings
             page_number: Page number where the chunk is located
 
@@ -146,7 +148,14 @@ class ChunkingService:
         if not pages_data or not page_number:
             return None
 
-        # Find the page data for this chunk
+        # First, try to extract heading directly from chunk text (Markdown format)
+        import re
+        header_pattern = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)
+        match = header_pattern.search(chunk_text)
+        if match:
+            return match.group(1).strip()
+
+        # Fallback: Find the page data for this chunk
         page_data = next(
             (p for p in pages_data if p["page_number"] == page_number), None
         )
@@ -160,14 +169,11 @@ class ChunkingService:
         if len(headings) == 1:
             return headings[0]["text"]
 
-        # Find heading that appears closest before the chunk text
-        # Use first 50 chars of chunk for matching
-        chunk_start = chunk_text[:50].strip()
-
-        # Try to find the heading in the chunk text or just before it
+        # Try to find the heading in the chunk text
         for heading in headings:
             heading_text = heading["text"]
-            if heading_text in chunk_text:
+            # Check both with and without Markdown syntax
+            if heading_text in chunk_text or f"# {heading_text}" in chunk_text:
                 return heading_text
 
         # Fallback: return first heading on the page

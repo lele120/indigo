@@ -1,13 +1,28 @@
 """
 Cross-Encoder Reranking Service
+
+Note: Requires sentence-transformers package (optional dependency).
+Install with: pip install sentence-transformers
+Or: pip install -r requirements-optional.txt
 """
-from typing import List, Dict
+from typing import List, Dict, Optional
 import structlog
-from sentence_transformers import CrossEncoder
 
 from app.core.config import settings
 
 logger = structlog.get_logger()
+
+# Optional import - only needed if ENABLE_RERANKING=true
+try:
+    from sentence_transformers import CrossEncoder
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    CrossEncoder = None
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    logger.warning(
+        "sentence_transformers_not_installed",
+        message="Cross-encoder reranking disabled. Install with: pip install sentence-transformers"
+    )
 
 
 class RerankingService:
@@ -29,6 +44,11 @@ class RerankingService:
     def _load_model(self):
         """Lazy load cross-encoder model"""
         if self._model is None:
+            if not SENTENCE_TRANSFORMERS_AVAILABLE:
+                raise ImportError(
+                    "sentence-transformers not installed. "
+                    "Install with: pip install sentence-transformers"
+                )
             logger.info("loading_cross_encoder_model", model=self.model_name)
             self._model = CrossEncoder(self.model_name, max_length=512)
             logger.info("cross_encoder_model_loaded", model=self.model_name)
@@ -55,6 +75,13 @@ class RerankingService:
 
         if not settings.ENABLE_RERANKING:
             logger.info("reranking_disabled")
+            return results
+
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            logger.warning(
+                "reranking_unavailable",
+                reason="sentence-transformers not installed"
+            )
             return results
 
         try:

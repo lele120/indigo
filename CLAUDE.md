@@ -21,9 +21,9 @@ The system consists of **8 containerized services** orchestrated via Docker Comp
 
 **Key Data Flow (Async)**:
 1. Frontend uploads → Backend validates → Enqueues Celery task → Returns task_id
-2. Celery Worker: PDF/TXT → PyMuPDF → LangChain chunking (1000 tokens, 200 overlap) → Batch OpenAI embeddings → Qdrant + PostgreSQL
+2. Celery Worker: PDF → **PyMuPDF4LLM (Markdown)** → LangChain chunking (1000 tokens, 200 overlap) → Batch OpenAI embeddings → Qdrant + PostgreSQL
 3. Frontend polls `/api/documents/upload/{task_id}/status` for progress
-4. MCP Server: **Hybrid search** (vector + BM25 + RRF + optional reranking) → Returns chunks with provenance
+4. MCP Server: **Hybrid search** (vector + BM25 w/ Markdown stripping + RRF + **cross-encoder reranking**) → Returns Markdown chunks with provenance
 
 ## Development Commands
 
@@ -93,20 +93,44 @@ npm run preview
 
 ## Core Technical Decisions
 
+### PDF Extraction with PyMuPDF4LLM
+
+**Extraction Method**: PyMuPDF4LLM for Markdown-based document processing
+- **Markdown output**: Documents extracted as Markdown for optimal LLM consumption
+- **Structure preservation**: Headers, tables, lists maintain semantic structure
+- **Multi-column handling**: Automatic reading order detection for complex layouts
+- **Performance**: ~5 seconds for 9-page PDF (vs 38s for IBM Docling)
+- **Table formatting**: Tables preserved as Markdown tables (`| col1 | col2 |`)
+- **Heading extraction**: Explicit Markdown headers (`#`, `##`, `###`) replace font-size heuristics
+
+**Benefits for RAG**:
+- LLMs are trained on Markdown → better comprehension
+- Section headings are explicit, improving chunk provenance
+- Tables remain structured, enabling accurate financial data extraction
+- BM25 search strips Markdown syntax for clean keyword matching
+
 ### Chunking Strategy
 
-**Text**: Semantic chunking with:
-- 512 tokens per chunk (default, max 1024)
-- 50 token overlap (~12.5%)
-- Split on natural boundaries (sentences, paragraphs)
+**Text**: LangChain RecursiveCharacterTextSplitter with Markdown-aware splitting:
+- 1000 tokens per chunk (configurable via `CHUNK_SIZE`)
+- 200 token overlap (20%) to prevent context loss
+- Split on natural boundaries: `\n\n` (paragraphs) → `\n` (lines) → `. ` (sentences) → ` ` (words)
+- Token counting uses `cl100k_base` (OpenAI GPT-3.5/4 tokenizer)
 
-**Tables**: Extracted via Tabula-py
-- Tables <10 rows: single chunk
-- Tables ≥10 rows: grouped by 10 rows with headers included
+**Section Heading Detection**:
+- Primary: Extract from Markdown headers (`^#{1,6}\s+(.+)$` regex)
+- Fallback: Match headings from page metadata (PyMuPDF4LLM TOC items)
+- Each chunk stores `section_heading` for provenance
 
-**Images**: OCR via PaddleOCR
-- Extract text from images embedded in PDFs
-- Store OCR text + bounding boxes + alt text descriptions
+**BM25 Indexing**:
+- Markdown syntax stripped before indexing: `strip_markdown_syntax()` removes `#`, `**`, `*`, `|`, `[]()`
+- Tokenization: Regex `\b\w+\b` extracts alphanumeric words only
+- Prevents Markdown symbols from polluting BM25 scores
+
+**Tables & Images** (future enhancement):
+- Tables: Currently embedded in Markdown chunks
+- Images: PyMuPDF4LLM supports image extraction (disabled with `write_images=False`)
+- OCR: PaddleOCR available for scanned PDFs (not yet integrated)
 
 ### Deduplication
 
@@ -189,7 +213,7 @@ Required in `.env`:
 - `QDRANT_GRPC_PORT`: Port (default: `6334`)
 - `CELERY_BROKER_URL`: Redis URL for Celery (default: `redis://redis:6379/0`)
 - `ENABLE_HYBRID_SEARCH`: Feature flag (default: `true`)
-- `ENABLE_RERANKING`: Feature flag (default: `false`, adds 170ms latency)
+- `ENABLE_RERANKING`: Feature flag (default: `true`, adds ~200ms latency after model load, ~10s first query)
 - `CHUNK_SIZE`: Token limit per chunk (default: `1000`)
 - `CHUNK_OVERLAP`: Overlap in tokens (default: `200`)
 
@@ -212,10 +236,13 @@ Required in `.env`:
 
 ## Key Features
 
-**Hybrid Search (Default)**:
+**Hybrid Search with Reranking (Default)**:
 - Combines dense (vector) + sparse (BM25) retrieval
 - Uses Reciprocal Rank Fusion (RRF): `RRF(d) = Σ 1/(k + rank(d))` where k=60
-- Optional cross-encoder re-ranking (feature flag: `ENABLE_RERANKING`)
+- **Cross-encoder reranking enabled by default** (sentence-transformers)
+  - Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+  - ~10s first query (model loading), ~200ms subsequent queries
+  - Can disable via `ENABLE_RERANKING=false`
 - **+30-40% recall** vs vector-only search
 - Cached results in Redis (TTL: 1800s)
 
@@ -244,6 +271,6 @@ Required in `.env`:
 - `docker-compose.yaml`: Service orchestration configuration
 - `.env.example`: Environment variable template
 - `backend/config.py`: Pydantic settings management
-- `backend/app/ingestion/`: PDF parsing, chunking, embedding logic
+- `backend/app/services/`: PDF parsing (PyMuPDF4LLM), chunking, embedding, search logic
 - `mcp/server.py`: FastMCP tool definitions and implementations
 - `frontend/src/`: React components for document management UI

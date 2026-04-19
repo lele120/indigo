@@ -140,30 +140,20 @@ class DocumentProcessor:
 
     @staticmethod
     def _extract_pdf(file_path: str) -> Tuple[str, int, List[Dict]]:
-        """Extract text from PDF"""
-        doc = fitz.open(file_path)
-        page_count = len(doc)
-        pages_data = []
-        full_text = []
+        """Extract text from PDF using PyMuPDF4LLM (Markdown output)"""
+        from app.services.pdf_service import PDFService
 
-        for page_num, page in enumerate(doc, start=1):
-            text = page.get_text("text")
-            pages_data.append({
-                "page_number": page_num,
-                "text": text,
-                "char_count": len(text),
-            })
-            full_text.append(text)
-
-        doc.close()
+        # Use PDFService which now returns Markdown
+        full_text, page_count, pages_data = PDFService.extract_text_from_pdf(file_path)
 
         logger.info(
             "pdf_extracted",
             file_path=file_path,
             page_count=page_count,
+            format="markdown",
         )
 
-        return "\n\n".join(full_text), page_count, pages_data
+        return full_text, page_count, pages_data
 
     @staticmethod
     def _extract_docx(file_path: str) -> Tuple[str, int, List[Dict]]:

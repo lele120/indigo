@@ -193,3 +193,36 @@ class TestChunkingService:
         heading = service._find_section_heading(chunk_text, pages_data, page_number=1)
 
         assert heading == "Introduction"
+
+    def test_find_section_heading_markdown_format(self):
+        """Test section heading detection from Markdown-formatted chunk"""
+        service = ChunkingService()
+
+        # Markdown formatted chunk with header
+        chunk_text = "## Financial Overview\n\nThe quarterly results show..."
+
+        # Empty pages_data (Markdown extraction should work without it)
+        pages_data = [
+            {
+                "page_number": 1,
+                "text": chunk_text,
+                "headings": []
+            }
+        ]
+
+        heading = service._find_section_heading(chunk_text, pages_data, page_number=1)
+
+        assert heading == "Financial Overview"
+
+    def test_find_section_heading_markdown_multiple_levels(self):
+        """Test that first heading is extracted from Markdown with multiple levels"""
+        service = ChunkingService()
+
+        # Chunk with nested headers (should extract first one)
+        chunk_text = "# Main Title\n\nSome intro text.\n\n## Subsection\n\nMore details..."
+
+        pages_data = [{"page_number": 1, "text": chunk_text, "headings": []}]
+
+        heading = service._find_section_heading(chunk_text, pages_data, page_number=1)
+
+        assert heading == "Main Title"

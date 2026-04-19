@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # Feature Flags
     ENABLE_HYBRID_SEARCH: bool = True
-    ENABLE_RERANKING: bool = False
+    ENABLE_RERANKING: bool = True  # Cross-encoder reranking with sentence-transformers
     ENABLE_RATE_LIMITING: bool = True
 
     # Search
