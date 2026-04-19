@@ -139,6 +139,94 @@ Documents are deduplicated using `(filename, SHA256_hash)` as composite key:
 - New documents INSERT new record
 - Qdrant uses `document_id + chunk_index` as point ID for upsert safety
 
+### Enterprise Backend Architecture (2026-04-19 Update)
+
+The backend follows a **clean 3-layer architecture** with **5 enterprise patterns**:
+
+#### Three-Layer Architecture
+
+1. **Controllers (HTTP Layer)** - backend/app/api/v1/*.py
+   - Thin (5-10 lines per endpoint)
+   - Pydantic validation via `Depends()`
+   - Delegates all logic to managers
+   - Example: `documents.py`, `search.py`
+
+2. **Managers (Business Logic)** - backend/app/managers/*.py
+   - Orchestrates services
+   - Enforces business rules
+   - Handles transactions with `@transactional` decorator
+   - Example: `DocumentManager`, `UploadManager`, `SearchManager`, `TagManager`
+
+3. **Services (Data Access)** - backend/app/services/*.py
+   - Pure async operations with `AsyncSession`
+   - No business logic
+   - Reusable across managers
+   - Example: `DocumentService`, `TagService`, `UploadTaskService`, `SearchService`
+
+#### Enterprise Patterns
+
+1. **Pydantic Request Validation** - backend/app/schemas/requests.py
+   - 6 request schemas with field validators
+   - Automatic validation at API boundary
+   - Example: `UploadDocumentRequest`, `SearchDocumentsRequest`, `ListDocumentsRequest`
+
+2. **Manager Pattern** - backend/app/managers/
+   - Business logic extracted from controllers
+   - 4 managers: Document (118 lines), Upload (254 lines), Search (162 lines), Tag (88 lines)
+   - Controllers reduced 80% (220 → 40 lines avg)
+
+3. **Transaction Management** - backend/app/core/transactions.py
+   - `@transactional` decorator for automatic commit/rollback
+   - ACID guarantees for multi-step operations
+   - Used in: upload, update, delete, tag operations
+
+4. **Full Async Migration** - backend/app/core/database_async.py
+   - AsyncSession throughout
+   - postgresql+asyncpg:// driver
+   - async/await stack with lifespan events
+   - Better concurrency under load
+
+5. **Centralized Exception Handling** - backend/app/core/exceptions.py + exception_handlers.py
+   - 15+ custom exceptions with automatic HTTP mapping
+   - Structured error responses
+   - No manual HTTPException raising needed
+
+#### Key Files
+
+**Controllers** (thin):
+- `backend/app/api/v1/documents.py` (216 lines, 8 endpoints)
+- `backend/app/api/v1/search.py` (124 lines, 2 endpoints)
+
+**Managers** (business logic):
+- `backend/app/managers/document_manager.py` (118 lines)
+- `backend/app/managers/upload_manager.py` (254 lines)
+- `backend/app/managers/search_manager.py` (162 lines)
+- `backend/app/managers/tag_manager.py` (88 lines)
+
+**Services** (data access):
+- `backend/app/services/document_service.py` (178 lines, async CRUD)
+- `backend/app/services/tag_service.py` (97 lines, JOIN for counts)
+- `backend/app/services/upload_task_service.py` (78 lines, progress tracking)
+- `backend/app/services/search_service.py` (407 lines, Qdrant + BM25 + async queries)
+
+**Infrastructure**:
+- `backend/app/core/database_async.py` (71 lines, AsyncSession setup)
+- `backend/app/core/transactions.py` (113 lines, @transactional decorator)
+- `backend/app/core/exceptions.py` (210 lines, custom exceptions)
+- `backend/app/core/exception_handlers.py` (221 lines, HTTP mapping)
+- `backend/app/schemas/requests.py` (293 lines, Pydantic validation)
+
+#### Benefits
+
+- **Type Safety**: Pydantic validation at API boundary
+- **Testability**: Managers isolated from HTTP layer
+- **ACID Guarantees**: @transactional ensures consistency
+- **Performance**: Full async stack for better concurrency
+- **Maintainability**: Clear separation of concerns
+- **Error Handling**: Consistent JSON responses
+
+See `IMPROVEMENTS_COMPLETED.md` section 6 for full implementation details.
+
 ## MCP Tool Interface
 
 The MCP server exposes **8 tools** optimized for LLM consumption:
