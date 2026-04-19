@@ -13,13 +13,13 @@ Features:
 - Centralized exception handling
 """
 from typing import Optional
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database_async import get_async_db
 from app.managers.search_manager import SearchManager
 from app.schemas.requests import SearchDocumentsRequest
-from app.schemas.search import SearchResponse
+from app.schemas.search import SearchRequest, SearchResponse
 
 router = APIRouter()
 
@@ -31,9 +31,9 @@ def get_search_manager(db: AsyncSession = Depends(get_async_db)) -> SearchManage
 
 @router.post("", response_model=SearchResponse)
 async def search_documents(
-    request: SearchDocumentsRequest = Depends(),
-    manager: SearchManager = Depends(get_search_manager),
+    request: SearchRequest = Body(...),
     use_cache: bool = Query(True, description="Use cache for search results"),
+    manager: SearchManager = Depends(get_search_manager),
 ):
     """
     Hybrid search across documents using vector similarity and BM25
@@ -85,7 +85,20 @@ async def search_documents(
     }
     ```
     """
-    return await manager.search(request, use_cache=use_cache)
+    # Convert SearchRequest to SearchDocumentsRequest
+    search_req = SearchDocumentsRequest(
+        query=request.query,
+        limit=request.limit,
+        document_ids=request.document_ids,
+        file_type=request.file_type,
+        author=request.author,
+        date_from=request.date_from,
+        date_to=request.date_to,
+        use_hybrid=request.use_hybrid,
+        vector_weight=request.vector_weight,
+        bm25_weight=request.bm25_weight,
+    )
+    return await manager.search(search_req, use_cache=use_cache)
 
 
 @router.get("", response_model=SearchResponse)

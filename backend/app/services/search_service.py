@@ -1,34 +1,38 @@
 """
 Hybrid Search Service combining Vector and BM25 retrieval with RRF
+
+Pure data access layer for search operations.
+Business logic (cache, reranking) handled by SearchManager.
 """
 from typing import List, Dict, Optional
 from uuid import UUID
+import asyncio
 import structlog
 from rank_bm25 import BM25Okapi
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.services.embedding_service import EmbeddingService
 from app.services.qdrant_service import QdrantService
-from app.services.cache_service import CacheService
 from app.services.reranking_service import RerankingService
-from app.models.document import Chunk
+from app.models.document import Chunk, Document
 from app.core.config import settings
 
 logger = structlog.get_logger()
 
 
 class SearchService:
-    """Hybrid search service combining vector and BM25 search with RRF"""
+    """Async hybrid search service combining vector and BM25 search with RRF"""
 
-    def __init__(self, db: Session):
-        """Initialize search service with database session"""
+    def __init__(self, db: AsyncSession):
+        """Initialize search service with async database session"""
         self.db = db
         self.embedding_service = EmbeddingService()
         self.qdrant_service = QdrantService()
-        self.cache_service = CacheService()
         self.reranking_service = RerankingService()
 
-    def search(
+    async def search(
         self,
         query: str,
         limit: int = 10,
@@ -40,57 +44,41 @@ class SearchService:
         use_hybrid: bool = True,
         vector_weight: float = 0.5,
         bm25_weight: float = 0.5,
-        use_cache: bool = True,
     ) -> List[Dict]:
         """
-        Perform hybrid search combining vector and BM25 retrieval with caching
+        Perform hybrid search combining vector and BM25 retrieval
+
+        Pure data access - no cache, no reranking (handled by Manager).
 
         Args:
             query: Search query text
             limit: Maximum number of results to return
             document_ids: Optional list of document IDs to filter by
+            file_type: Filter by file type
+            author: Filter by author (partial match)
+            date_from: Filter documents uploaded after this date
+            date_to: Filter documents uploaded before this date
             use_hybrid: If True, use hybrid search; if False, use vector only
             vector_weight: Weight for vector search results (0.0-1.0)
             bm25_weight: Weight for BM25 search results (0.0-1.0)
-            use_cache: If True, use cached results when available
 
         Returns:
             List of search results with scores and metadata
         """
-        # Try cache first
-        if use_cache:
-            cached_results = self.cache_service.get(
-                "search",
-                query=query,
-                limit=limit,
-                document_ids=document_ids,
-                file_type=file_type,
-                author=author,
-                date_from=date_from,
-                date_to=date_to,
-                use_hybrid=use_hybrid,
-                vector_weight=vector_weight,
-                bm25_weight=bm25_weight,
-            )
-            if cached_results is not None:
-                logger.info("search_cache_hit", query=query)
-                return cached_results
-
         logger.info(
             "search_started",
             query=query,
             limit=limit,
             use_hybrid=use_hybrid,
-            use_cache=use_cache,
         )
 
         if not use_hybrid:
             # Vector search only
-            results = self._vector_search(query, limit, document_ids, file_type, author, date_from, date_to)
+            results = await self._vector_search(query, limit, document_ids, file_type, author, date_from, date_to)
         else:
             # Hybrid search: Vector + BM25 + RRF
-            vector_results = self._vector_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
-            bm25_results = self._bm25_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
+            vector_results = await self._vector_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
+            bm25_results = await self._bm25_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
 
             # Reciprocal Rank Fusion
             merged_results = self._reciprocal_rank_fusion(
@@ -100,18 +88,8 @@ class SearchService:
                 bm25_weight=bm25_weight,
             )
 
-            # Apply cross-encoder reranking if enabled
-            if settings.ENABLE_RERANKING:
-                logger.info("applying_reranking", query=query, num_results=len(merged_results))
-                merged_results = self.reranking_service.rerank(
-                    query=query,
-                    results=merged_results,
-                    top_k=limit  # Rerank and return top K
-                )
-                results = merged_results
-            else:
-                # No reranking, just limit
-                results = merged_results[:limit]
+            # Limit results (reranking handled by Manager)
+            results = merged_results[:limit]
 
         logger.info(
             "search_completed",
@@ -119,26 +97,9 @@ class SearchService:
             final_count=len(results),
         )
 
-        # Cache results
-        if use_cache and results:
-            self.cache_service.set(
-                "search",
-                results,
-                query=query,
-                limit=limit,
-                document_ids=document_ids,
-                file_type=file_type,
-                author=author,
-                date_from=date_from,
-                date_to=date_to,
-                use_hybrid=use_hybrid,
-                vector_weight=vector_weight,
-                bm25_weight=bm25_weight,
-            )
-
         return results
 
-    def _vector_search(
+    async def _vector_search(
         self,
         query: str,
         limit: int,
@@ -164,31 +125,31 @@ class SearchService:
             List of results with vector similarity scores
         """
         try:
-            from app.models.document import Document
-
             # Apply filters to get filtered document IDs
             filtered_doc_ids = document_ids
 
             if file_type or author or date_from or date_to:
-                # Query documents with filters
-                doc_query = self.db.query(Document.id)
+                # Build async query with filters
+                doc_query = select(Document.id)
 
                 if document_ids:
-                    doc_query = doc_query.filter(Document.id.in_([UUID(did) for did in document_ids]))
+                    doc_query = doc_query.where(Document.id.in_([UUID(did) for did in document_ids]))
 
                 if file_type:
-                    doc_query = doc_query.filter(Document.file_type == file_type)
+                    doc_query = doc_query.where(Document.file_type == file_type)
 
                 if author:
-                    doc_query = doc_query.filter(Document.author.ilike(f"%{author}%"))
+                    doc_query = doc_query.where(Document.author.ilike(f"%{author}%"))
 
                 if date_from:
-                    doc_query = doc_query.filter(Document.uploaded_at >= date_from)
+                    doc_query = doc_query.where(Document.uploaded_at >= date_from)
 
                 if date_to:
-                    doc_query = doc_query.filter(Document.uploaded_at <= date_to)
+                    doc_query = doc_query.where(Document.uploaded_at <= date_to)
 
-                filtered_doc_ids = [str(doc.id) for doc in doc_query.all()]
+                # Execute async query
+                result = await self.db.execute(doc_query)
+                filtered_doc_ids = [str(row[0]) for row in result.all()]
 
                 if not filtered_doc_ids:
                     return []
@@ -222,7 +183,7 @@ class SearchService:
             logger.error("vector_search_failed", error=str(e), exc_info=True)
             return []
 
-    def _bm25_search(
+    async def _bm25_search(
         self,
         query: str,
         limit: int,
@@ -248,34 +209,68 @@ class SearchService:
             List of results with BM25 scores
         """
         try:
-            from app.models.document import Document
-
-            # Query chunks from database with JOIN on documents
-            chunks_query = self.db.query(Chunk).join(Document, Chunk.document_id == Document.id)
+            # Build async query with JOIN on documents
+            chunks_query = select(Chunk).join(Document, Chunk.document_id == Document.id)
 
             # Apply filters
             if document_ids:
-                chunks_query = chunks_query.filter(
+                chunks_query = chunks_query.where(
                     Chunk.document_id.in_([UUID(did) for did in document_ids])
                 )
 
             if file_type:
-                chunks_query = chunks_query.filter(Document.file_type == file_type)
+                chunks_query = chunks_query.where(Document.file_type == file_type)
 
             if author:
-                chunks_query = chunks_query.filter(Document.author.ilike(f"%{author}%"))
+                chunks_query = chunks_query.where(Document.author.ilike(f"%{author}%"))
 
             if date_from:
-                chunks_query = chunks_query.filter(Document.uploaded_at >= date_from)
+                chunks_query = chunks_query.where(Document.uploaded_at >= date_from)
 
             if date_to:
-                chunks_query = chunks_query.filter(Document.uploaded_at <= date_to)
+                chunks_query = chunks_query.where(Document.uploaded_at <= date_to)
 
-            chunks = chunks_query.all()
+            # Execute async query
+            result = await self.db.execute(chunks_query)
+            chunks = result.scalars().all()
 
             if not chunks:
                 return []
 
+            # Prepare corpus for BM25 (CPU-intensive, run in executor)
+            loop = asyncio.get_event_loop()
+            bm25_results = await loop.run_in_executor(
+                None,
+                self._perform_bm25_scoring,
+                chunks,
+                query,
+                limit
+            )
+
+            return bm25_results
+
+        except Exception as e:
+            logger.error("bm25_search_failed", error=str(e), exc_info=True)
+            return []
+
+    def _perform_bm25_scoring(
+        self,
+        chunks: List[Chunk],
+        query: str,
+        limit: int
+    ) -> List[Dict]:
+        """
+        Perform BM25 scoring on chunks (CPU-intensive, runs in executor)
+
+        Args:
+            chunks: List of chunks to score
+            query: Search query text
+            limit: Maximum number of results
+
+        Returns:
+            List of results with BM25 scores
+        """
+        try:
             # Prepare corpus for BM25
             # Strip Markdown syntax for better keyword matching
             from app.services.pdf_service import PDFService
@@ -325,7 +320,7 @@ class SearchService:
             return results[:limit]
 
         except Exception as e:
-            logger.error("bm25_search_failed", error=str(e), exc_info=True)
+            logger.error("bm25_scoring_failed", error=str(e), exc_info=True)
             return []
 
     def _reciprocal_rank_fusion(

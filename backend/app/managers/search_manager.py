@@ -1,7 +1,13 @@
 """
 Search Manager - Orchestrates hybrid search operations
 
-Coordinates vector search, BM25, RRF, and reranking.
+Business logic:
+- Cache management
+- Reranking coordination
+- Document metadata enrichment
+- Timing metrics
+
+Uses SearchService for data access (Qdrant, BM25, DB queries).
 """
 from typing import List, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +20,7 @@ from app.schemas.requests import SearchDocumentsRequest
 from app.schemas.search import SearchResponse, SearchResult
 from app.services.search_service import SearchService
 from app.services.cache_service import CacheService
+from app.core.config import settings
 
 logger = structlog.get_logger()
 
@@ -23,9 +30,7 @@ class SearchManager:
 
     def __init__(self, db: AsyncSession):
         self.db = db
-        # SearchService currently sync - will need async conversion
-        # For now, use sync version with run_in_executor if needed
-        self.search_service = None  # Initialize in async context
+        self.search_service = SearchService(db)  # Now fully async
         self.cache_service = CacheService()
 
     async def search(
@@ -83,26 +88,30 @@ class SearchManager:
                     search_time_ms=cached.get("search_time_ms")
                 )
 
-        # Perform search (TODO: convert SearchService to async)
-        # For now, create sync session for SearchService
-        from app.core.database import SessionLocal
-        sync_db = SessionLocal()
-        try:
-            search_service = SearchService(sync_db)
-            raw_results = search_service.search(
+        # Perform search via async service
+        raw_results = await self.search_service.search(
+            query=request.query,
+            limit=request.limit * 2 if settings.ENABLE_RERANKING else request.limit,  # Get more for reranking
+            document_ids=request.document_ids,
+            file_type=request.file_type,
+            author=request.author,
+            date_from=request.date_from,
+            date_to=request.date_to,
+            use_hybrid=request.use_hybrid,
+            vector_weight=request.vector_weight,
+            bm25_weight=request.bm25_weight,
+        )
+
+        # Apply cross-encoder reranking if enabled (business logic)
+        if settings.ENABLE_RERANKING and raw_results:
+            logger.info("applying_reranking", query=request.query, num_results=len(raw_results))
+            from app.services.reranking_service import RerankingService
+            reranking_service = RerankingService()
+            raw_results = reranking_service.rerank(
                 query=request.query,
-                limit=request.limit,
-                document_ids=request.document_ids,
-                file_type=request.file_type,
-                author=request.author,
-                date_from=request.date_from,
-                date_to=request.date_to,
-                use_hybrid=request.use_hybrid,
-                vector_weight=request.vector_weight,
-                bm25_weight=request.bm25_weight,
+                results=raw_results,
+                top_k=request.limit
             )
-        finally:
-            sync_db.close()
 
         # Enrich with document names (async)
         enriched_results = []
