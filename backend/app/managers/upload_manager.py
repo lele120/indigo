@@ -1,19 +1,21 @@
 """
 Upload Manager - Orchestrates document upload workflow
 
-Responsibilities:
+Business logic:
 - File validation (type, size, format)
-- Duplicate detection
-- Document creation with transaction
-- Task queuing for async processing
+- File operations (hash calculation, temp storage)
+- Duplicate detection via DocumentService
+- Document creation via DocumentService
+- Task creation via UploadTaskService
+- Celery task queuing
+
+Uses DocumentService, TagService, UploadTaskService for data access.
 """
 import os
 import tempfile
 import hashlib
-from typing import Optional
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 import structlog
 
 from app.core.transactions import transactional
@@ -23,17 +25,20 @@ from app.core.exceptions import (
     UnsupportedFileTypeException,
     DuplicateDocumentException,
 )
-from app.models.document import Document, Tag, UploadTask
-from app.schemas.document import FileUploadResponse
+from app.models.document import Document
+from app.schemas.document import FileUploadResponse, DocumentCreate
 from app.schemas.requests import UploadDocumentRequest
 from app.core.config import settings
+from app.services.document_service import DocumentService
+from app.services.tag_service import TagService
+from app.services.upload_task_service import UploadTaskService
 from app.tasks.document_tasks import process_document
 
 logger = structlog.get_logger()
 
 
 class UploadManager:
-    """Manager for document upload operations"""
+    """Manager for document upload business logic orchestration"""
 
     ALLOWED_EXTENSIONS = {
         ".pdf", ".txt", ".md", ".markdown",
@@ -56,10 +61,13 @@ class UploadManager:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+        self.document_service = DocumentService(db)
+        self.tag_service = TagService(db)
+        self.upload_task_service = UploadTaskService(db)
 
     async def _validate_file(self, file: UploadFile) -> None:
         """
-        Validate file before processing
+        Validate file before processing (Business logic)
 
         Checks:
         - File extension
@@ -109,7 +117,7 @@ class UploadManager:
         )
 
     async def _calculate_hash(self, file: UploadFile) -> str:
-        """Calculate SHA256 hash of file content"""
+        """Calculate SHA256 hash of file content (Business logic)"""
         sha256 = hashlib.sha256()
         file.file.seek(0)
 
@@ -120,7 +128,7 @@ class UploadManager:
         return sha256.hexdigest()
 
     async def _save_temp_file(self, file: UploadFile) -> str:
-        """Save uploaded file to temporary location"""
+        """Save uploaded file to temporary location (Business logic)"""
         file_ext = os.path.splitext(file.filename)[1]
         temp_file = tempfile.NamedTemporaryFile(
             delete=False,
@@ -137,23 +145,6 @@ class UploadManager:
         finally:
             temp_file.close()
 
-    async def _get_or_create_tag(self, tag_name: str) -> Tag:
-        """Get existing tag or create new one"""
-        # Check if tag exists
-        result = await self.db.execute(
-            select(Tag).where(Tag.name == tag_name.lower())
-        )
-        tag = result.scalar_one_or_none()
-
-        if tag:
-            return tag
-
-        # Create new tag
-        tag = Tag(name=tag_name.lower())
-        self.db.add(tag)
-        await self.db.flush()  # Get ID without committing
-        return tag
-
     @transactional
     async def upload_document(
         self,
@@ -161,15 +152,16 @@ class UploadManager:
         request: UploadDocumentRequest
     ) -> FileUploadResponse:
         """
-        Handle complete document upload workflow
+        Handle complete document upload workflow (Business orchestration)
 
         Steps:
-        1. Validate file
-        2. Calculate hash and check duplicates
-        3. Save to temp location
-        4. Create document record in transaction
-        5. Create upload task
-        6. Queue async processing
+        1. Validate file (business logic)
+        2. Calculate hash and check duplicates (via DocumentService)
+        3. Save to temp location (business logic)
+        4. Create document record (via DocumentService)
+        5. Add tags (via TagService)
+        6. Create upload task (via UploadTaskService)
+        7. Queue async processing (business logic)
 
         Args:
             file: Uploaded file
@@ -190,51 +182,39 @@ class UploadManager:
         # Step 2: Calculate hash and check duplicates
         file_hash = await self._calculate_hash(file)
 
-        # Check for duplicate
-        result = await self.db.execute(
-            select(Document).where(
-                Document.file_hash == file_hash,
-                Document.name == file.filename
-            )
-        )
-        existing_doc = result.scalar_one_or_none()
-
-        if existing_doc:
+        # Check for duplicate via service
+        existing_doc = await self.document_service.get_by_hash(file_hash)
+        if existing_doc and existing_doc.name == file.filename:
             raise DuplicateDocumentException(file.filename, file_hash)
 
         # Step 3: Save to temp location
         temp_path = await self._save_temp_file(file)
 
         try:
-            # Step 4: Create document record
+            # Step 4: Create document record via service
             file.file.seek(0, 2)
             file_size = file.file.tell()
 
-            document = Document(
+            document_create = DocumentCreate(
                 name=file.filename,
                 file_hash=file_hash,
                 file_size=file_size,
                 mime_type=file.content_type or "application/octet-stream",
-                status="pending",
+                tags=request.tags if request.tags else None
             )
 
-            # Add tags if provided
+            document = await self.document_service.create(document_create)
+
+            # Step 5: Add tags if provided (via TagService)
             if request.tags:
                 for tag_name in request.tags:
-                    tag = await self._get_or_create_tag(tag_name)
+                    tag = await self.tag_service.get_or_create(tag_name)
                     document.tags.append(tag)
 
-            self.db.add(document)
-            await self.db.flush()  # Get document ID
+            await self.db.flush()  # Ensure tags are associated
 
-            # Step 5: Create upload task
-            task = UploadTask(
-                document_id=document.id,
-                status="queued",
-                progress=0,
-            )
-            self.db.add(task)
-            await self.db.flush()  # Get task ID
+            # Step 6: Create upload task via service
+            task = await self.upload_task_service.create(document.id)
 
             # Transaction commits here automatically via @transactional
 
@@ -245,7 +225,7 @@ class UploadManager:
                 filename=file.filename
             )
 
-            # Step 6: Queue async processing (outside transaction)
+            # Step 7: Queue async processing (outside transaction)
             process_document.delay(
                 str(document.id),
                 str(task.id),

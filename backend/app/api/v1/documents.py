@@ -1,344 +1,216 @@
 """
-Document API endpoints
-"""
-import os
-import tempfile
-from typing import List, Optional
-from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
-from sqlalchemy.orm import Session
-import structlog
+Document API endpoints - Clean 3-layer architecture
 
-from app.core.database import get_db
-from app.services.document_service import DocumentService
-from app.services.document_processor import DocumentProcessor
+Architecture:
+- Controllers: HTTP handling, Pydantic validation
+- Managers: Business logic orchestration, @transactional
+- Services: Pure data access, async operations
+
+Features:
+- Pydantic request validation (automatic)
+- Manager pattern (business logic separation)
+- Async/await throughout
+- Centralized exception handling
+- Transaction management (@transactional)
+"""
+from uuid import UUID
+from fastapi import APIRouter, Depends, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database_async import get_async_db
+from app.managers import DocumentManager, UploadManager, TagManager
 from app.schemas.document import (
     DocumentResponse,
     DocumentListResponse,
-    DocumentUpdate,
+    FileUploadResponse,
     TagResponse,
     UploadTaskResponse,
-    FileUploadResponse,
-    DocumentCreate,
-    DocumentStatsResponse,
 )
-from app.tasks.document_tasks import process_document
-
-logger = structlog.get_logger()
+from app.schemas.requests import (
+    UploadDocumentRequest,
+    UpdateDocumentRequest,
+    ListDocumentsRequest,
+)
 
 router = APIRouter()
 
 
+# Dependency to get managers
+def get_upload_manager(db: AsyncSession = Depends(get_async_db)) -> UploadManager:
+    return UploadManager(db)
+
+
+def get_document_manager(db: AsyncSession = Depends(get_async_db)) -> DocumentManager:
+    return DocumentManager(db)
+
+
+def get_tag_manager(db: AsyncSession = Depends(get_async_db)) -> TagManager:
+    return TagManager(db)
+
+
 @router.post("/upload", response_model=FileUploadResponse, status_code=201)
 async def upload_document(
-    file: UploadFile = File(...),
-    tags: Optional[str] = Query(None, description="Comma-separated tags"),
-    chunk_size: Optional[int] = Query(None, ge=100, le=2000, description="Custom chunk size in tokens (default: 1000)"),
-    chunk_overlap: Optional[int] = Query(None, ge=0, le=500, description="Custom chunk overlap in tokens (default: 200)"),
-    db: Session = Depends(get_db),
+    file: UploadFile = File(..., description="Document file to upload"),
+    request: UploadDocumentRequest = Depends(),
+    manager: UploadManager = Depends(get_upload_manager),
 ):
     """
-    Upload a document for processing
+    Upload document with automatic validation
 
-    Supported formats:
-    - **PDF**: .pdf
-    - **Word**: .docx, .doc
-    - **Excel**: .xlsx, .xls
-    - **CSV**: .csv
-    - **Text**: .txt, .md, .markdown, .rst
-    - **PowerPoint**: .pptx, .ppt
+    **New Features**:
+    - Automatic request validation via Pydantic
+    - Transaction management via @transactional decorator
+    - Centralized exception handling
+    - Full async/await stack
 
-    Args:
-    - **file**: Document file to upload (required)
-    - **tags**: Optional comma-separated tags (e.g., "finance,report,2024")
-    - **chunk_size**: Optional custom chunk size in tokens (100-2000, default: 1000)
-        - Controls how text is split into searchable chunks
-        - Larger chunks preserve more context but may be less precise
-        - Smaller chunks are more precise but may lose context
-    - **chunk_overlap**: Optional chunk overlap in tokens (0-500, default: 200)
-        - How many tokens overlap between consecutive chunks
-        - Higher overlap improves context continuity
-        - Must be less than chunk_size
+    **Request Parameters** (auto-validated):
+    - file: Document file (required)
+    - tags: List of tags (optional, validated)
+    - chunk_size: 100-2000 (default: 1000, validated)
+    - chunk_overlap: 0-500 (default: 200, validated, must be < chunk_size)
 
-    Returns:
+    **Raises** (handled automatically):
+    - InvalidFileException: Invalid file type/size
+    - DuplicateDocumentException: File already exists
+    - FileTooLargeException: File exceeds limit
+
+    **Returns**:
     - document_id: UUID of created document
-    - task_id: UUID of processing task (use to check status)
+    - task_id: UUID for status polling
     - message: Success message
-
-    Processing:
-    1. Document text is extracted (supports all formats above)
-    2. Metadata (author, title) extracted if available
-    3. Text is chunked with specified parameters
-    4. Embeddings generated (or falls back to BM25-only if OpenAI fails)
-    5. Stored in vector DB for hybrid search
-
-    Example:
-    ```bash
-    curl -X POST "http://localhost:8000/api/v1/documents/upload?chunk_size=800&chunk_overlap=150" \\
-      -F "file=@document.pdf" \\
-      -F "tags=legal,contract,2024"
-    ```
     """
-    logger.info("document_upload_started", filename=file.filename)
-
-    # Validate chunk parameters
-    if chunk_size is not None and chunk_overlap is not None:
-        if chunk_overlap >= chunk_size:
-            raise HTTPException(
-                status_code=400,
-                detail=f"chunk_overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size})"
-            )
-
-    if chunk_size is not None and chunk_size <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="chunk_size must be greater than 0"
-        )
-
-    if chunk_overlap is not None and chunk_overlap < 0:
-        raise HTTPException(
-            status_code=400,
-            detail="chunk_overlap must be non-negative"
-        )
-
-    # Validate file type
-    file_ext = os.path.splitext(file.filename)[1].lower()
-    all_supported_extensions = [ext for exts in DocumentProcessor.SUPPORTED_FORMATS.values() for ext in exts]
-
-    if file_ext not in all_supported_extensions:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format: {file_ext}. Supported formats: {', '.join(all_supported_extensions)}"
-        )
-
-    try:
-        # Read file content
-        content = await file.read()
-
-        # Calculate hash
-        file_hash = DocumentService.calculate_file_hash(content)
-
-        # Check for duplicates
-        existing = DocumentService.check_duplicate(db, file_hash)
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Document already exists with ID: {existing.id}",
-            )
-
-        # Parse tags
-        tag_list = None
-        if tags:
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-
-        # Create document record
-        document_data = DocumentCreate(
-            name=file.filename,
-            file_hash=file_hash,
-            file_size=len(content),
-            mime_type=file.content_type or "application/pdf",
-            tags=tag_list,
-        )
-
-        document = DocumentService.create_document(db, document_data)
-
-        # Create upload task
-        task = DocumentService.create_upload_task(db, document.id)
-
-        # Save file temporarily in shared volume
-        temp_dir = "/tmp/uploads"
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.join(temp_dir, f"{document.id}{file_ext}")
-        with open(file_path, "wb") as f:
-            f.write(content)
-
-        # Queue processing task
-        process_document.delay(
-            str(document.id),
-            str(task.id),
-            file_path,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-
-        logger.info(
-            "document_upload_completed",
-            document_id=str(document.id),
-            task_id=str(task.id),
-            filename=file.filename,
-        )
-
-        return FileUploadResponse(
-            document_id=document.id,
-            task_id=task.id,
-            message="Document uploaded successfully and queued for processing",
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("document_upload_failed", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    return await manager.upload_document(file, request)
 
 
 @router.get("", response_model=DocumentListResponse)
-def list_documents(
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    status: Optional[str] = Query(None, description="Filter by status"),
-    tags: Optional[str] = Query(None, description="Filter by tags (comma-separated)"),
-    search: Optional[str] = Query(None, description="Search in document names"),
-    db: Session = Depends(get_db),
+async def list_documents(
+    request: ListDocumentsRequest = Depends(),
+    manager: DocumentManager = Depends(get_document_manager),
 ):
     """
     List documents with pagination and filters
 
-    - **page**: Page number (starts at 1)
-    - **page_size**: Number of items per page (max 100)
-    - **status**: Filter by status (pending, processing, completed, failed)
-    - **tags**: Filter by tags (comma-separated)
-    - **search**: Search term for document names
+    **Auto-validated parameters**:
+    - page: Page number (default: 1, must be >= 1)
+    - page_size: Items per page (default: 20, range: 1-100)
+    - file_type: Filter by type (optional)
+    - author: Filter by author (optional)
+    - tag: Filter by tag (optional)
+
+    **Benefits of new pattern**:
+    - No manual validation needed
+    - Business logic in manager (testable)
+    - Full async for better performance
     """
-    skip = (page - 1) * page_size
+    documents, total = await manager.list_documents(request)
 
-    # Parse tags
-    tag_list = None
-    if tags:
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    # Convert to response schema
+    document_responses = [
+        DocumentResponse.model_validate(doc) for doc in documents
+    ]
 
-    # Get documents
-    documents, total = DocumentService.get_documents(
-        db,
-        skip=skip,
-        limit=page_size,
-        status=status,
-        tags=tag_list,
-        search=search,
-    )
-
-    # Calculate total pages
-    pages = (total + page_size - 1) // page_size
+    pages = (total + request.page_size - 1) // request.page_size
 
     return DocumentListResponse(
-        items=documents,
+        items=document_responses,
         total=total,
-        page=page,
-        page_size=page_size,
+        page=request.page,
+        page_size=request.page_size,
         pages=pages,
     )
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-def get_document(
+async def get_document(
     document_id: UUID,
-    db: Session = Depends(get_db),
+    manager: DocumentManager = Depends(get_document_manager),
 ):
     """
-    Get a specific document by ID
+    Get document by ID
 
-    - **document_id**: UUID of the document
+    **Automatic error handling**:
+    - DocumentNotFoundException -> 404 response (automatic)
+    - DatabaseException -> 500 response (automatic)
+
+    No manual HTTPException raising needed!
     """
-    document = DocumentService.get_document(db, document_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    return document
+    document = await manager.get_document(document_id)
+    return DocumentResponse.model_validate(document)
 
 
-@router.patch("/{document_id}", response_model=DocumentResponse)
-def update_document(
+@router.put("/{document_id}", response_model=DocumentResponse)
+async def update_document(
     document_id: UUID,
-    document_update: DocumentUpdate,
-    db: Session = Depends(get_db),
+    request: UpdateDocumentRequest,
+    manager: DocumentManager = Depends(get_document_manager),
 ):
     """
-    Update a document (name and/or tags)
+    Update document metadata
 
-    - **document_id**: UUID of the document
-    - **name**: New document name (optional)
-    - **tags**: New tags list (optional)
+    **Validated fields**:
+    - name: 1-500 chars (optional, auto-trimmed)
+    - tags: List of strings (optional, deduplicated)
+
+    **Transaction safety**:
+    - All updates in single transaction via @transactional
+    - Auto-rollback on error
     """
-    document = DocumentService.update_document(db, document_id, document_update)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    return document
+    document = await manager.update_document(document_id, request)
+    return DocumentResponse.model_validate(document)
 
 
 @router.delete("/{document_id}", status_code=204)
-def delete_document(
+async def delete_document(
     document_id: UUID,
-    db: Session = Depends(get_db),
+    manager: DocumentManager = Depends(get_document_manager),
 ):
     """
-    Delete a document
+    Delete document (cascades to chunks and tasks)
 
-    - **document_id**: UUID of the document
+    **Transaction safety**:
+    - Atomic delete via @transactional
+    - Cascades handled by database relationships
 
-    This will also delete:
-    - All chunks associated with this document
-    - Upload tasks
-    - Vector embeddings from Qdrant
+    **Error handling**:
+    - DocumentNotFoundException -> 404 (automatic)
     """
-    success = DocumentService.delete_document(db, document_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    # Delete from Qdrant
-    try:
-        from app.services.qdrant_service import QdrantService
-        qdrant_service = QdrantService()
-        qdrant_service.delete_by_document(document_id)
-        logger.info("qdrant_vectors_deleted", document_id=str(document_id))
-    except Exception as e:
-        logger.warning("qdrant_deletion_failed", document_id=str(document_id), error=str(e))
-
-    logger.info("document_deleted", document_id=str(document_id))
-    return None
+    await manager.delete_document(document_id)
 
 
-@router.get("/tasks/{task_id}", response_model=UploadTaskResponse)
-def get_task_status(
+@router.get("/tasks/{task_id}/status", response_model=UploadTaskResponse)
+async def get_task_status(
     task_id: UUID,
-    db: Session = Depends(get_db),
+    manager: DocumentManager = Depends(get_document_manager),
 ):
     """
-    Get upload task status
+    Get upload task status for progress tracking
 
-    - **task_id**: UUID of the upload task
+    **Polling endpoint** for frontend to track upload progress (0-100%).
 
-    Returns current status and progress (0-100)
+    **Error handling**:
+    - TaskNotFoundException -> 404 (automatic)
     """
-    task = DocumentService.get_upload_task(db, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return task
+    task = await manager.get_task_status(task_id)
+    return UploadTaskResponse.model_validate(task)
 
 
-@router.get("/tags/all", response_model=List[TagResponse])
-def list_tags(db: Session = Depends(get_db)):
+@router.get("/tags/all", response_model=list[TagResponse], response_model_exclude_none=False)
+async def list_all_tags(
+    manager: TagManager = Depends(get_tag_manager),
+):
     """
-    Get all available tags
+    List all tags with document counts
 
-    Returns list of all tags in the system
+    **Async query** with JOIN for counts (efficient).
     """
-    tags = DocumentService.get_all_tags(db)
-    return tags
+    tags_data = await manager.list_tags()
 
-
-@router.get("/stats", response_model=DocumentStatsResponse)
-def get_statistics(db: Session = Depends(get_db)):
-    """
-    Get document statistics
-
-    Returns aggregated statistics including:
-    - Total document count
-    - Count by status (pending, processing, completed, failed)
-    - List of all unique tags
-
-    This endpoint uses an optimized query with a single database call
-    instead of multiple queries, providing much faster response times.
-    """
-    stats = DocumentService.get_stats(db)
-    return DocumentStatsResponse(**stats)
+    return [
+        TagResponse(
+            id=tag["id"],
+            name=tag["name"],
+            created_at=tag["created_at"],
+            document_count=tag["document_count"]
+        )
+        for tag in tags_data
+    ]

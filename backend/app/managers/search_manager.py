@@ -143,7 +143,7 @@ class SearchManager:
         if use_cache:
             self.cache_service.set(
                 "search",
-                response.dict(),
+                response.model_dump(),  # Pydantic v2 compatibility
                 query=request.query,
                 limit=request.limit,
                 document_ids=request.document_ids,
