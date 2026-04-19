@@ -561,10 +561,17 @@ Tested on MacBook Pro M1, 16GB RAM, local Docker:
 
 MIT
 
+## Part 1: AI-Assisted Coding
+
+**Required by assignment**: Answers to questions about AI-assisted development workflow.
+
+See **[PART1.md](./PART1.md)** for:
+1. How I use AI tools (Claude Code, ChatGPT, Cursor) in my workflow
+2. The value and limitations of AI-assisted development
+3. My vision for the AI Solutions Engineer role evolution
+
+---
+
 ## Support
 
 For issues and questions, see `PLAN.md` for detailed architecture and implementation guide.
-
-## Part 1: AI-Assisted Coding
-
-See [PART1.md](./PART1.md) for responses to AI workflow questions required by the assignment.
