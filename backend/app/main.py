@@ -1,9 +1,12 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 import structlog
 
 from app.core.config import settings
+from app.core.exception_handlers import register_exception_handlers
+from app.core.database_async import init_async_db, close_async_db
 from app.api.v1 import api_router
 
 # Configure structured logging
@@ -18,12 +21,37 @@ if settings.STRUCTLOG_ENABLED:
 
 logger = structlog.get_logger()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for startup and shutdown events
+
+    Handles:
+    - Async database initialization
+    - Resource cleanup on shutdown
+    """
+    # Startup
+    logger.info("application_startup")
+    await init_async_db()
+
+    yield
+
+    # Shutdown
+    logger.info("application_shutdown")
+    await close_async_db()
+
+
 # Create FastAPI app
 app = FastAPI(
     title="Indigo Document Intelligence Server",
     description="RAG system with MCP server for semantic document search",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
+
+# Register exception handlers
+register_exception_handlers(app)
 
 # CORS middleware
 app.add_middleware(

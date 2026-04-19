@@ -13,12 +13,12 @@ class TagCreate(BaseModel):
 
 
 class TagResponse(BaseModel):
+    model_config = {"from_attributes": True}
+
     id: int
     name: str
     created_at: datetime
-
-    class Config:
-        from_attributes = True
+    document_count: Optional[int] = Field(default=None, description="Number of documents with this tag")
 
 
 # Document schemas

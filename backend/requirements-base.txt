@@ -1,0 +1,17 @@
+# Heavy ML/AI dependencies (rarely change, cached layer)
+# These are the big downloads: PyTorch (~530MB), CUDA libs (~366MB), etc.
+
+# Vector Store & Search - HEAVY
+sentence-transformers>=2.2.2  # Pulls in PyTorch, transformers (~1GB total)
+qdrant-client>=1.7.0
+openai>=1.12.0
+rank-bm25>=0.2.2
+
+# Chunking - HEAVY
+langchain>=0.1.0
+langchain-text-splitters>=0.0.1
+tiktoken>=0.5.0
+
+# Document Processing - HEAVY
+pymupdf>=1.23.0  # PDF base library
+pymupdf4llm>=0.0.17  # PDF to Markdown for LLM/RAG

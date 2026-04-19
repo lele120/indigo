@@ -11,13 +11,20 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first (better caching)
-COPY requirements.txt .
-
-# Install Python dependencies with pip cache for faster rebuilds
+# Layer 1: Heavy ML dependencies (cached, rarely changes)
+# This layer includes PyTorch (~530MB), CUDA libs (~366MB), sentence-transformers, etc.
+# Only rebuilds when requirements-base.txt changes
+COPY requirements-base.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-base.txt
+
+# Layer 2: Lightweight app dependencies (rebuilds more frequently)
+# This layer includes fastapi, asyncpg, sqlalchemy, etc.
+# Only rebuilds when requirements-app.txt changes
+COPY requirements-app.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements-app.txt
 
 # Copy application code (changes frequently, so last)
 COPY . .
