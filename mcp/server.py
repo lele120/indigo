@@ -158,7 +158,7 @@ def _resolve_document_ids(identifiers: List[str]) -> tuple[List[str], List[str]]
     unresolved: List[str] = []
     if name_candidates:
         resp = make_backend_request(
-            "get", "/api/v1/documents", params={"page_size": 100}
+            "get", "/api/v1/documents", params={"page_size": 1000}
         )
         items = resp.json().get("items", [])
         name_to_id = {d["name"]: d["id"] for d in items}
@@ -221,39 +221,33 @@ def format_error_for_llm(error: Exception, operation: str) -> str:
 def list_documents(
     page: int = 1,
     page_size: int = 10,
-    status: Optional[Literal["pending", "processing", "completed", "failed"]] = None,
-    tags: Optional[List[str]] = None,
-    search: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> str:
     """
-    List documents with optional filtering and pagination.
+    List documents with pagination and optional tag filtering.
+
+    To scope by multiple tags, use ``search_by_tag`` (returns ranked passages)
+    or ``search_with_filters`` (combines tag and document filters). To look
+    up a single document by UUID, use ``get_document``.
 
     Args:
-        page: Page number (default: 1)
-        page_size: Number of documents per page (default: 10, max: 100)
-        status: Filter by ingestion status.
-        tags: Filter by tag names (list). Documents returned must carry at
-            least one of the listed tags.
-        search: Case-insensitive substring match on the document name.
+        page: Page number (default: 1).
+        page_size: Number of documents per page (default: 10, max: 100).
+        tag: Optional tag name — returns only documents carrying this tag.
 
     Returns:
-        JSON string with documents list and pagination info
+        JSON string with documents list and pagination info.
     """
     operation = "list_documents"
     try:
-        logger.info(f"{operation}_called", page=page, page_size=page_size)
+        logger.info(f"{operation}_called", page=page, page_size=page_size, tag=tag)
 
         params = {
             "page": page,
             "page_size": min(page_size, 100),
         }
-
-        if status:
-            params["status"] = status
-        if tags:
-            params["tags"] = ",".join(t.strip() for t in tags if t and t.strip())
-        if search:
-            params["search"] = search
+        if tag:
+            params["tag"] = tag
 
         response = make_backend_request("get", "/api/v1/documents", params=params)
         data = response.json()
@@ -387,7 +381,7 @@ def search_by_tag(
             resp = make_backend_request(
                 "get",
                 "/api/v1/documents",
-                params={"tag": tag, "page_size": 100},
+                params={"tag": tag, "page_size": 1000},
             )
             items = resp.json().get("items", [])
             doc_id_sets.append({d["id"] for d in items})
@@ -565,7 +559,7 @@ def search_with_filters(
                 resp = make_backend_request(
                     "get",
                     "/api/v1/documents",
-                    params={"tag": tag, "page_size": 100},
+                    params={"tag": tag, "page_size": 1000},
                 )
                 items = resp.json().get("items", [])
                 sets.append({d["id"] for d in items})
@@ -723,17 +717,27 @@ def upload_document(
                 })
 
         with open(file_path, "rb") as fh:
-            files = {"file": (os.path.basename(file_path), fh.read(), mime_type)}
+            content = fh.read()
 
-        data = {}
+        # FastAPI's ``List[str]`` on a multipart form expects repeated
+        # fields (``tags=a&tags=b``), not a single CSV value. httpx's
+        # multipart encoder supports this only when **every** form field
+        # — file and plain — is passed through ``files=`` as a list of
+        # ``(name, (filename, value, content_type))`` tuples. Mixing a
+        # ``files=`` dict with ``data=[...]`` raises TypeError.
+        parts: List[tuple] = [
+            ("file", (os.path.basename(file_path), content, mime_type)),
+        ]
         if tags:
-            data["tags"] = ",".join(t.strip() for t in tags if t and t.strip())
+            parts.extend(
+                ("tags", (None, t.strip(), "text/plain"))
+                for t in tags if t and t.strip()
+            )
 
         response = make_backend_request(
             "post",
             "/api/v1/documents/upload",
-            files=files,
-            data=data,
+            files=parts,
         )
         result = response.json()
 
@@ -785,7 +789,7 @@ def update_document(
             return json.dumps({"error": "No updates provided. Specify name or tags."})
 
         response = make_backend_request(
-            "patch",
+            "put",
             f"/api/v1/documents/{document_id}",
             json=payload,
         )

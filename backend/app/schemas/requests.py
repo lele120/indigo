@@ -221,8 +221,10 @@ class ListDocumentsRequest(BaseModel):
     page_size: int = Field(
         default=20,
         ge=1,
-        le=100,
-        description="Number of items per page"
+        le=1000,
+        description="Number of items per page (max 1000; MCP resolver tools "
+                    "pass 1000 to resolve tag→docs and name→UUID in a single "
+                    "round-trip)"
     )
     file_type: Optional[str] = Field(
         default=None,

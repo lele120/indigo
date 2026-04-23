@@ -469,7 +469,7 @@ Once services are running:
 
 The MCP server exposes **11 tools** via Streamable HTTP (port 8001):
 
-1. **list_documents** — paginated list with filters (`status`, `tags`, `search` on name)
+1. **list_documents** — paginated list, optional filter by `tag` (single tag). For multi-tag scoping prefer `search_by_tag` or `search_with_filters`
 2. **search** — global hybrid semantic search (vector + BM25 + RRF + cross-encoder reranking)
 3. **list_tags** — all unique tags in the knowledge base
 4. **search_by_tag** — search scoped by tags, with `match_all` (AND) vs ANY semantics
