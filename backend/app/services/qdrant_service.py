@@ -101,6 +101,7 @@ class QdrantService:
                     "text": chunk["text"][:1000],  # Store preview (limit to 1000 chars)
                     "text_preview": chunk["text"][:200],  # Short preview
                     "page_number": chunk.get("page_number"),
+                    "section_heading": chunk.get("section_heading"),
                     "chunk_type": chunk.get("chunk_type", "text"),
                     "token_count": chunk.get("token_count", 0),
                     "char_count": chunk.get("char_count", 0),
@@ -196,6 +197,8 @@ class QdrantService:
                     "text": result.payload.get("text"),
                     "text_preview": result.payload.get("text_preview"),
                     "page_number": result.payload.get("page_number"),
+                    "chunk_index": result.payload.get("chunk_index"),
+                    "section_heading": result.payload.get("section_heading"),
                     "chunk_type": result.payload.get("chunk_type"),
                     "score": result.score,
                 })

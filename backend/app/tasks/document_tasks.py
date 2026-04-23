@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
-from app.services.document_service import DocumentService
 from app.services.document_processor import DocumentProcessor
 from app.services.chunking_service import ChunkingService
 from app.services.embedding_service import EmbeddingService
@@ -54,7 +53,7 @@ def process_document(self, document_id: str, task_id: str, file_path: str, chunk
         doc_uuid = UUID(document_id)
         task_uuid = UUID(task_id)
 
-        document = DocumentService.get_document(db, doc_uuid)
+        document = db.query(Document).filter(Document.id == doc_uuid).first()
         if not document:
             raise ValueError(f"Document {document_id} not found")
 
@@ -63,7 +62,7 @@ def process_document(self, document_id: str, task_id: str, file_path: str, chunk
         db.commit()
 
         # Update task status
-        task = DocumentService.get_upload_task(db, task_uuid)
+        task = db.query(UploadTask).filter(UploadTask.id == task_uuid).first()
         if task:
             task.status = "processing"
             task.started_at = datetime.utcnow()
@@ -199,14 +198,14 @@ def process_document(self, document_id: str, task_id: str, file_path: str, chunk
 
         # Update document status
         try:
-            document = DocumentService.get_document(db, UUID(document_id))
+            document = db.query(Document).filter(Document.id == UUID(document_id)).first()
             if document:
                 document.status = "failed"
                 document.error_message = str(e)
                 db.commit()
 
             # Update task status
-            task = DocumentService.get_upload_task(db, UUID(task_id))
+            task = db.query(UploadTask).filter(UploadTask.id == UUID(task_id)).first()
             if task:
                 task.status = "failed"
                 task.error_message = str(e)

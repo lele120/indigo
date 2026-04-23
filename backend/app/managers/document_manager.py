@@ -4,7 +4,7 @@ Document Manager - Business logic orchestration for documents
 Coordinates CRUD operations, transactions, and business rules.
 Uses DocumentService and TagService for data access.
 """
-from typing import List, Tuple
+from typing import List, Literal, Tuple
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
@@ -14,6 +14,8 @@ from app.core.exceptions import DocumentNotFoundException, TaskNotFoundException
 from app.models.document import Document, UploadTask
 from app.schemas.requests import UpdateDocumentRequest, ListDocumentsRequest
 from app.services.document_service import DocumentService
+from app.services.pdf_service import PDFService
+from app.services.qdrant_service import QdrantService
 from app.services.tag_service import TagService
 from app.services.upload_task_service import UploadTaskService
 
@@ -94,18 +96,81 @@ class DocumentManager:
 
         return document
 
-    @transactional
     async def delete_document(self, document_id: UUID) -> None:
-        """
-        Delete document (cascades to chunks and tasks)
+        """Delete document from Postgres, then cascade-clean Qdrant.
 
-        Business logic:
-        - Validate document exists
-        - Delete via service (cascade handled by DB)
+        Postgres cascade handles chunks/tasks rows. Qdrant has no FK, so
+        we must delete its points by document_id ourselves. The Qdrant
+        cleanup runs AFTER the PG transaction commits — if it fails we
+        log and move on (leaves orphan vector points, better than
+        rolling back a user-visible delete).
+        """
+        await self._delete_from_db(document_id)
+
+        import asyncio
+        try:
+            qdrant = QdrantService()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, qdrant.delete_by_document, document_id)
+        except Exception as e:
+            logger.warning(
+                "qdrant_cascade_delete_failed",
+                document_id=str(document_id),
+                error=str(e),
+            )
+
+    @transactional
+    async def _delete_from_db(self, document_id: UUID) -> None:
+        """Transactional Postgres delete (chunks/tasks cascade via FK).
+
+        Also prunes tags that are no longer attached to any document — left
+        alone they accumulate in list_tags across upload/delete cycles.
+        """
+        await self.get_document(document_id)
+        await self.document_service.delete(document_id)
+        orphan_count = await self.tag_service.delete_orphans()
+        logger.info(
+            "document_deleted",
+            document_id=str(document_id),
+            orphan_tags_pruned=orphan_count,
+        )
+
+    async def get_document_content(
+        self,
+        document_id: UUID,
+        format: Literal["text", "markdown", "json"] = "markdown",
+    ) -> dict:
+        """Reconstruct document content from its chunks.
+
+        - markdown: chunks joined with blank lines, markdown preserved
+        - text:     same join, then markdown syntax stripped
+        - json:     structured list of chunks with metadata
         """
         document = await self.get_document(document_id)
-        await self.document_service.delete(document_id)
-        logger.info("document_deleted", document_id=str(document_id))
+        chunks = await self.document_service.get_chunks_by_document(document_id)
+
+        if format == "json":
+            content = [
+                {
+                    "chunk_index": c.chunk_index,
+                    "chunk_type": c.chunk_type,
+                    "page_number": c.page_number,
+                    "section_heading": c.section_heading,
+                    "text": c.text or "",
+                }
+                for c in chunks
+            ]
+        else:
+            joined = "\n\n".join(c.text for c in chunks if c.text)
+            content = PDFService.strip_markdown_syntax(joined) if format == "text" else joined
+
+        return {
+            "id": document.id,
+            "name": document.name,
+            "format": format,
+            "chunk_count": len(chunks),
+            "content": content,
+        }
 
     async def get_task_status(self, task_id: UUID) -> UploadTask:
         """Get upload task status"""
@@ -115,3 +180,7 @@ class DocumentManager:
             raise TaskNotFoundException(str(task_id))
 
         return task
+
+    async def get_stats(self) -> dict:
+        """Get document statistics (counts by status + tag list)"""
+        return await self.document_service.get_stats()

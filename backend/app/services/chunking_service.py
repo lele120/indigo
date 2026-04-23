@@ -65,18 +65,25 @@ class ChunkingService:
                 avg_chunk_size=sum(len(c) for c in chunks) / len(chunks) if chunks else 0,
             )
 
-            # Create chunk metadata
+            # Create chunk metadata. Chunks are produced in document order
+            # by the splitter, so we can propagate the last-seen heading
+            # forward: mid-section chunks (tables, continuations) inherit
+            # the heading from their enclosing section instead of getting None.
             chunk_data = []
+            last_heading = None
             for i, chunk_text in enumerate(chunks):
                 # Try to determine page number for this chunk
                 page_number = self._estimate_page_number(
                     chunk_text, pages_data
                 ) if pages_data else None
 
-                # Try to determine section heading for this chunk
-                section_heading = self._find_section_heading(
+                local_heading = self._find_section_heading(
                     chunk_text, pages_data, page_number
                 ) if pages_data else None
+
+                if local_heading:
+                    last_heading = local_heading
+                section_heading = local_heading or last_heading
 
                 chunk_data.append({
                     "chunk_index": i,

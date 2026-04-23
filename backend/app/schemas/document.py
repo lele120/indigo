@@ -2,7 +2,7 @@
 Document schemas for API validation
 """
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Literal, Optional, Union
 from uuid import UUID
 from pydantic import BaseModel, Field
 
@@ -90,6 +90,27 @@ class FileUploadResponse(BaseModel):
     document_id: UUID
     task_id: UUID
     message: str
+
+
+# Document content schema
+class DocumentChunkContent(BaseModel):
+    """Single chunk as returned by the JSON content format."""
+    chunk_index: int
+    chunk_type: str
+    page_number: Optional[int]
+    section_heading: Optional[str]
+    text: str
+
+
+class DocumentContentResponse(BaseModel):
+    """Full document content reconstructed from chunks."""
+    id: UUID
+    name: str
+    format: Literal["text", "markdown", "json"]
+    chunk_count: int
+    content: Union[str, List[DocumentChunkContent]] = Field(
+        description="String for text/markdown formats, list of chunks for json format"
+    )
 
 
 # Document statistics schema

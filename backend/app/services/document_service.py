@@ -11,7 +11,7 @@ from sqlalchemy import select, func, desc, case
 from sqlalchemy.orm import selectinload
 import hashlib
 
-from app.models.document import Document, Tag
+from app.models.document import Document, Tag, Chunk
 from app.schemas.document import DocumentCreate
 
 
@@ -30,6 +30,15 @@ class DocumentService:
 
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
+
+    async def get_chunks_by_document(self, document_id: UUID) -> List[Chunk]:
+        """Get all chunks for a document ordered by chunk_index."""
+        result = await self.db.execute(
+            select(Chunk)
+            .where(Chunk.document_id == document_id)
+            .order_by(Chunk.chunk_index)
+        )
+        return list(result.scalars().all())
 
     async def get_by_hash(self, file_hash: str) -> Optional[Document]:
         """Get document by file hash"""
@@ -80,8 +89,17 @@ class DocumentService:
 
         return list(documents), total
 
-    async def create(self, document: DocumentCreate) -> Document:
-        """Create a new document (no commit, managed by transaction)"""
+    async def create(
+        self,
+        document: DocumentCreate,
+        tags: Optional[List[Tag]] = None,
+    ) -> Document:
+        """Create a new document (no commit, managed by transaction).
+
+        Tags must be passed as resolved ORM objects and are assigned before
+        the document enters the session, so the collection is considered
+        'loaded' and no async lazy IO is triggered by later access.
+        """
         db_document = Document(
             name=document.name,
             file_hash=document.file_hash,
@@ -89,6 +107,8 @@ class DocumentService:
             mime_type=document.mime_type,
             status="pending",
         )
+        if tags:
+            db_document.tags = tags
 
         self.db.add(db_document)
         await self.db.flush()  # Get ID but don't commit

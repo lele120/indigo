@@ -95,3 +95,26 @@ class TagService:
             .options(selectinload(Document.tags))
         )
         return list(result.scalars().all())
+
+    async def delete_orphans(self) -> int:
+        """Delete tags that are no longer attached to any document.
+
+        Kept as a bulk SQL operation (no per-tag round trip) so it's cheap
+        to invoke as a post-delete cleanup hook.
+        Returns the number of orphan tags removed.
+        """
+        orphan_ids_result = await self.db.execute(
+            select(Tag.id).outerjoin(DocumentTag, Tag.id == DocumentTag.tag_id)
+            .group_by(Tag.id)
+            .having(func.count(DocumentTag.document_id) == 0)
+        )
+        orphan_ids = [row[0] for row in orphan_ids_result.all()]
+        if not orphan_ids:
+            return 0
+
+        from sqlalchemy import delete as sa_delete
+        await self.db.execute(
+            sa_delete(Tag).where(Tag.id.in_(orphan_ids))
+        )
+        await self.db.flush()
+        return len(orphan_ids)

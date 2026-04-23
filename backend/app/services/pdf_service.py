@@ -48,24 +48,44 @@ class PDFService:
             )
 
             pages_data = []
-            full_text_parts = []
+            raw_page_texts: List[str] = []
 
             for page_data in md_pages:
-                page_num = page_data["metadata"]["page"] + 1  # pymupdf4llm uses 0-based indexing
+                # pymupdf4llm >=1.27 uses 1-based 'page_number'; older versions
+                # used 0-based 'page'. Support both for compatibility.
+                meta = page_data["metadata"]
+                if "page_number" in meta:
+                    page_num = meta["page_number"]
+                else:
+                    page_num = meta["page"] + 1
                 md_text = page_data["text"]
-
-                # Extract headings from Markdown text
-                headings = PDFService._extract_headings_from_markdown(md_text)
 
                 pages_data.append({
                     "page_number": page_num,
-                    "text": md_text,
+                    "text": md_text,  # cleaned below
                     "char_count": len(md_text),
-                    "headings": headings,
+                    "headings": [],  # populated after cleaning
                     "toc_items": page_data["metadata"].get("toc_items", []),
                 })
+                raw_page_texts.append(md_text)
 
-                full_text_parts.append(md_text)
+            # Strip running headers/footers that appear on many pages
+            # (DOI footers, repeated titles, page-number lines, etc.).
+            boilerplate_lines = PDFService._detect_boilerplate_lines(raw_page_texts)
+            if boilerplate_lines:
+                logger.info(
+                    "pdf_boilerplate_detected",
+                    file_path=file_path,
+                    lines_filtered=len(boilerplate_lines),
+                )
+
+            full_text_parts = []
+            for page_data, raw_text in zip(pages_data, raw_page_texts):
+                cleaned = PDFService._strip_boilerplate(raw_text, boilerplate_lines)
+                page_data["text"] = cleaned
+                page_data["char_count"] = len(cleaned)
+                page_data["headings"] = PDFService._extract_headings_from_markdown(cleaned)
+                full_text_parts.append(cleaned)
 
             full_text = "\n\n".join(full_text_parts)
 
@@ -151,6 +171,56 @@ class PDFService:
                 error=str(e),
             )
             return {}
+
+    @staticmethod
+    def _detect_boilerplate_lines(
+        page_texts: List[str],
+        min_pages: int = 5,
+        repetition_ratio: float = 0.3,
+    ) -> set:
+        """Find lines that recur on many pages — running headers/footers.
+
+        A line qualifies as boilerplate if it appears on at least
+        `repetition_ratio` of pages (and the doc has at least `min_pages`
+        pages). Short numeric-only strings (bare page numbers) are also
+        flagged regardless of repetition.
+        """
+        if len(page_texts) < min_pages:
+            return set()
+
+        from collections import Counter
+        counts: Counter = Counter()
+        for text in page_texts:
+            seen_on_page = set()
+            for raw_line in text.split("\n"):
+                line = raw_line.strip()
+                if not line or len(line) < 6:
+                    continue
+                seen_on_page.add(line)
+            for line in seen_on_page:
+                counts[line] += 1
+
+        threshold = max(2, int(len(page_texts) * repetition_ratio))
+        return {line for line, n in counts.items() if n >= threshold}
+
+    @staticmethod
+    def _strip_boilerplate(text: str, boilerplate: set) -> str:
+        """Remove matched boilerplate lines and bare page numbers."""
+        if not boilerplate and not text:
+            return text
+        cleaned_lines = []
+        for raw_line in text.split("\n"):
+            stripped = raw_line.strip()
+            if stripped in boilerplate:
+                continue
+            # Drop lines that are just a page number
+            if stripped.isdigit() and len(stripped) <= 4:
+                continue
+            cleaned_lines.append(raw_line)
+        # Collapse runs of blank lines left by removals
+        result = "\n".join(cleaned_lines)
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
 
     @staticmethod
     def strip_markdown_syntax(text: str) -> str:
