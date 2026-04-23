@@ -3,11 +3,13 @@ Indigo MCP Server - Document Intelligence Tools
 
 Provides 10 tools for document management and search via MCP protocol.
 """
+import mimetypes
 import os
 import json
+import re
 import uuid
 import logging
-from typing import Optional, List
+from typing import List, Literal, Optional
 import httpx
 import structlog
 from fastmcp import FastMCP
@@ -129,6 +131,45 @@ def make_backend_request(method: str, endpoint: str, **kwargs):
         raise
 
 
+_UUID_PAT = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_document_ids(identifiers: List[str]) -> tuple[List[str], List[str]]:
+    """Resolve a mixed list of UUIDs and document names to UUIDs.
+
+    Names are looked up against the current document listing. Returns
+    ``(resolved_uuids, unresolved_names)`` — the caller decides how to
+    surface ``unresolved`` to the agent (warning vs. error).
+    """
+    resolved: List[str] = []
+    name_candidates: List[str] = []
+    for raw in identifiers:
+        item = (raw or "").strip()
+        if not item:
+            continue
+        if _UUID_PAT.match(item):
+            resolved.append(item)
+        else:
+            name_candidates.append(item)
+
+    unresolved: List[str] = []
+    if name_candidates:
+        resp = make_backend_request(
+            "get", "/api/v1/documents", params={"page_size": 100}
+        )
+        items = resp.json().get("items", [])
+        name_to_id = {d["name"]: d["id"] for d in items}
+        for name in name_candidates:
+            if name in name_to_id:
+                resolved.append(name_to_id[name])
+            else:
+                unresolved.append(name)
+    return resolved, unresolved
+
+
 def format_error_for_llm(error: Exception, operation: str) -> str:
     """
     Format error messages in a way that's helpful for LLMs to understand.
@@ -180,8 +221,8 @@ def format_error_for_llm(error: Exception, operation: str) -> str:
 def list_documents(
     page: int = 1,
     page_size: int = 10,
-    status: Optional[str] = None,
-    tags: Optional[str] = None,
+    status: Optional[Literal["pending", "processing", "completed", "failed"]] = None,
+    tags: Optional[List[str]] = None,
     search: Optional[str] = None,
 ) -> str:
     """
@@ -190,9 +231,10 @@ def list_documents(
     Args:
         page: Page number (default: 1)
         page_size: Number of documents per page (default: 10, max: 100)
-        status: Filter by status (pending, processing, completed, failed)
-        tags: Filter by comma-separated tags
-        search: Search in document names
+        status: Filter by ingestion status.
+        tags: Filter by tag names (list). Documents returned must carry at
+            least one of the listed tags.
+        search: Case-insensitive substring match on the document name.
 
     Returns:
         JSON string with documents list and pagination info
@@ -209,7 +251,7 @@ def list_documents(
         if status:
             params["status"] = status
         if tags:
-            params["tags"] = tags
+            params["tags"] = ",".join(t.strip() for t in tags if t and t.strip())
         if search:
             params["search"] = search
 
@@ -228,20 +270,26 @@ def list_documents(
 def search(
     query: str,
     limit: int = 10,
-    document_ids: Optional[str] = None,
+    document_ids: Optional[List[str]] = None,
     use_hybrid: bool = True,
 ) -> str:
     """
-    Hybrid search across documents using vector similarity and BM25.
+    Hybrid search across the whole knowledge base. Combines dense vector
+    similarity (OpenAI text-embedding-3-small) with BM25 keyword matching,
+    fused via Reciprocal Rank Fusion and optionally re-ranked with a
+    cross-encoder. Use this for open-ended questions where the agent has
+    no prior reason to restrict the scope; for scoped queries prefer
+    ``search_by_tag``, ``search_by_document`` or ``search_with_filters``.
 
     Args:
         query: Search query text (required)
         limit: Maximum number of results (default: 10, max: 100)
-        document_ids: Optional comma-separated document IDs to filter by
-        use_hybrid: Use hybrid search (vector + BM25) or vector only (default: true)
+        document_ids: Optional list of document UUIDs to restrict the search to.
+        use_hybrid: Hybrid (vector + BM25) if true (default), vector-only if false.
 
     Returns:
-        JSON string with search results ranked by relevance
+        JSON string with search results ranked by relevance, including
+        ``page_number`` and ``section_heading`` for each chunk.
     """
     operation = "search"
     try:
@@ -254,7 +302,7 @@ def search(
         }
 
         if document_ids:
-            payload["document_ids"] = [did.strip() for did in document_ids.split(",")]
+            payload["document_ids"] = [d.strip() for d in document_ids if d and d.strip()]
 
         response = make_backend_request("post", "/api/v1/search", json=payload)
         data = response.json()
@@ -418,35 +466,7 @@ def search_by_document(
                 "search_by_document",
             )
 
-        import re
-        uuid_pat = re.compile(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            re.IGNORECASE,
-        )
-        resolved_ids: List[str] = []
-        unresolved: List[str] = []
-        name_candidates: List[str] = []
-        for d in documents:
-            d = (d or "").strip()
-            if not d:
-                continue
-            if uuid_pat.match(d):
-                resolved_ids.append(d)
-            else:
-                name_candidates.append(d)
-
-        if name_candidates:
-            # Single listing call, then look up each name locally.
-            resp = make_backend_request(
-                "get", "/api/v1/documents", params={"page_size": 100}
-            )
-            items = resp.json().get("items", [])
-            name_to_id = {d["name"]: d["id"] for d in items}
-            for name in name_candidates:
-                if name in name_to_id:
-                    resolved_ids.append(name_to_id[name])
-                else:
-                    unresolved.append(name)
+        resolved_ids, unresolved = _resolve_document_ids(documents)
 
         if not resolved_ids:
             return json.dumps(
@@ -487,7 +507,139 @@ def search_by_document(
 
 
 @mcp.tool()
-def get_document(document_id: str, format: Optional[str] = None) -> str:
+def search_with_filters(
+    query: str,
+    tags: Optional[List[str]] = None,
+    documents: Optional[List[str]] = None,
+    match_all_tags: bool = False,
+    limit: int = 10,
+    use_hybrid: bool = True,
+) -> str:
+    """
+    Hybrid semantic search with combined filters.
+
+    Use this when the agent needs to narrow the search by **both** tags and
+    specific documents in a single call — e.g. "find privacy-related
+    passages, but only inside these two policies". Equivalent to intersecting
+    ``search_by_tag`` and ``search_by_document`` but without chaining tools.
+
+    At least one of ``tags`` or ``documents`` must be provided; if neither
+    is given, prefer the plain ``search`` tool.
+
+    Args:
+        query: Search query text (required).
+        tags: Optional list of tag names. Documents not carrying at least
+            one of these tags (or all of them if ``match_all_tags`` is true)
+            are excluded.
+        documents: Optional list of UUIDs or document names. Only passages
+            inside the resolved set are considered.
+        match_all_tags: If true, only documents tagged with ALL listed tags
+            are included. Defaults to ANY.
+        limit: Maximum results (default 10, max 100).
+        use_hybrid: Hybrid vector + BM25 retrieval with reranking (default true).
+
+    Returns:
+        JSON string with ranked search results and a ``_filter`` block
+        reporting the resolved filter set (matching_doc_count, unresolved
+        names if any).
+    """
+    try:
+        logger.info(
+            "search_with_filters_called",
+            query=query, tags=tags, documents=documents, match_all_tags=match_all_tags,
+        )
+
+        if not tags and not documents:
+            return format_error_for_llm(
+                ValueError(
+                    "search_with_filters requires at least one of tags or documents; "
+                    "use the plain `search` tool for unfiltered queries."
+                ),
+                "search_with_filters",
+            )
+
+        tag_doc_ids: Optional[set] = None
+        if tags:
+            sets: List[set] = []
+            for tag in tags:
+                resp = make_backend_request(
+                    "get",
+                    "/api/v1/documents",
+                    params={"tag": tag, "page_size": 100},
+                )
+                items = resp.json().get("items", [])
+                sets.append({d["id"] for d in items})
+            tag_doc_ids = (
+                set.intersection(*sets) if match_all_tags and sets
+                else set.union(*sets) if sets
+                else set()
+            )
+
+        doc_doc_ids: Optional[set] = None
+        unresolved: List[str] = []
+        if documents:
+            resolved, unresolved = _resolve_document_ids(documents)
+            doc_doc_ids = set(resolved)
+
+        if tag_doc_ids is not None and doc_doc_ids is not None:
+            matching_ids = tag_doc_ids & doc_doc_ids
+        elif tag_doc_ids is not None:
+            matching_ids = tag_doc_ids
+        else:
+            matching_ids = doc_doc_ids or set()
+
+        if not matching_ids:
+            return json.dumps(
+                {
+                    "query": query,
+                    "results": [],
+                    "total": 0,
+                    "use_hybrid": use_hybrid,
+                    "_filter": {
+                        "tags": tags or [],
+                        "match_all_tags": match_all_tags,
+                        "documents": documents or [],
+                        "matching_doc_count": 0,
+                        "unresolved_names": unresolved,
+                    },
+                    "note": "No documents satisfy the combined filter set.",
+                },
+                indent=2,
+            )
+
+        payload = {
+            "query": query,
+            "limit": min(limit, 100),
+            "use_hybrid": use_hybrid,
+            "document_ids": list(matching_ids),
+        }
+        resp = make_backend_request("post", "/api/v1/search", json=payload)
+        data = resp.json()
+        data["_filter"] = {
+            "tags": tags or [],
+            "match_all_tags": match_all_tags,
+            "documents": documents or [],
+            "matching_doc_count": len(matching_ids),
+            "unresolved_names": unresolved,
+        }
+
+        logger.info(
+            "search_with_filters_success",
+            results=data.get("total", 0),
+            matching_doc_count=len(matching_ids),
+        )
+        return json.dumps(data, indent=2)
+
+    except Exception as e:
+        logger.error("search_with_filters_failed", error=str(e))
+        return format_error_for_llm(e, "search_with_filters")
+
+
+@mcp.tool()
+def get_document(
+    document_id: str,
+    format: Optional[Literal["text", "markdown", "json"]] = None,
+) -> str:
     """
     Get a document by ID.
 
@@ -511,10 +663,6 @@ def get_document(document_id: str, format: Optional[str] = None) -> str:
                 "get", f"/api/v1/documents/{document_id}"
             )
         else:
-            if format not in ("text", "markdown", "json"):
-                return json.dumps({
-                    "error": f"Invalid format: {format!r}. Must be one of: text, markdown, json"
-                })
             response = make_backend_request(
                 "get",
                 f"/api/v1/documents/{document_id}/content",
@@ -533,33 +681,53 @@ def get_document(document_id: str, format: Optional[str] = None) -> str:
 @mcp.tool()
 def upload_document(
     file_path: str,
-    tags: Optional[str] = None,
+    tags: Optional[List[str]] = None,
 ) -> str:
     """
-    Upload a PDF document for processing.
+    Upload a PDF or plain-text document for asynchronous processing.
+
+    Supported types: ``application/pdf`` (``.pdf``) and ``text/plain`` (``.txt``).
+    The file is parsed, chunked, embedded and indexed in the background;
+    the response contains ``document_id`` and ``task_id`` — poll the task
+    for progress, or call ``get_document`` once the status is ``completed``.
 
     Args:
-        file_path: Local path to the PDF file
-        tags: Optional comma-separated tags
+        file_path: Local path to the PDF or .txt file (must be accessible
+            to the MCP server's filesystem).
+        tags: Optional list of tag names to attach at upload time.
 
     Returns:
-        JSON string with document_id, task_id, and upload status
+        JSON string with document_id, task_id, and upload status.
     """
     try:
         logger.info("upload_document_called", file_path=file_path)
 
-        # Check if file exists
         if not os.path.exists(file_path):
             return json.dumps({"error": f"File not found: {file_path}"})
 
-        # Prepare multipart form data
-        files = {
-            "file": (os.path.basename(file_path), open(file_path, "rb"), "application/pdf")
-        }
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type not in ("application/pdf", "text/plain"):
+            # Fall back to extension-based inference so obviously-supported
+            # files still go through even if mimetypes misreads them.
+            ext = os.path.splitext(file_path)[1].lower()
+            mime_type = {
+                ".pdf": "application/pdf",
+                ".txt": "text/plain",
+            }.get(ext)
+            if mime_type is None:
+                return json.dumps({
+                    "error": (
+                        f"Unsupported file type for {file_path!r}. "
+                        "Only .pdf and .txt are accepted."
+                    )
+                })
+
+        with open(file_path, "rb") as fh:
+            files = {"file": (os.path.basename(file_path), fh.read(), mime_type)}
 
         data = {}
         if tags:
-            data["tags"] = tags
+            data["tags"] = ",".join(t.strip() for t in tags if t and t.strip())
 
         response = make_backend_request(
             "post",
@@ -579,29 +747,39 @@ def upload_document(
 
 @mcp.tool()
 def update_document(
-    document_id: str,
+    document: str,
     name: Optional[str] = None,
-    tags: Optional[str] = None,
+    tags: Optional[List[str]] = None,
 ) -> str:
     """
     Update a document's name and/or tags.
 
     Args:
-        document_id: UUID of the document
-        name: New document name (optional)
-        tags: New comma-separated tags (optional)
+        document: Document identifier — either a UUID or the exact
+            document name/filename (e.g. "compliance-faq.txt"). Names
+            are resolved against the current document set.
+        name: New document name (optional).
+        tags: New list of tag names (optional). Replaces the existing
+            tag set; pass an empty list to clear tags.
 
     Returns:
-        JSON string with updated document details
+        JSON string with updated document details.
     """
     try:
-        logger.info("update_document_called", document_id=document_id)
+        logger.info("update_document_called", document=document)
+
+        resolved, unresolved = _resolve_document_ids([document])
+        if unresolved or not resolved:
+            return json.dumps({
+                "error": f"Document not found: {document!r}. No UUID or name match.",
+            })
+        document_id = resolved[0]
 
         payload = {}
-        if name:
+        if name is not None:
             payload["name"] = name
-        if tags:
-            payload["tags"] = [tag.strip() for tag in tags.split(",")]
+        if tags is not None:
+            payload["tags"] = [t.strip() for t in tags if t and t.strip()]
 
         if not payload:
             return json.dumps({"error": "No updates provided. Specify name or tags."})
@@ -617,25 +795,37 @@ def update_document(
         return json.dumps(data, indent=2)
 
     except Exception as e:
-        logger.error(f"update_document_failed", document_id=document_id, error=str(e))
+        logger.error(f"update_document_failed", document=document, error=str(e))
         return format_error_for_llm(e, "update_document")
 
 
 @mcp.tool()
-def delete_document(document_id: str) -> str:
+def delete_document(document: str) -> str:
     """
     Delete a document and all associated data (chunks, vectors, tasks).
 
+    **Destructive**: this permanently removes the document, its chunks,
+    the Qdrant points and the upload-task history. Prefer confirming with
+    the user before calling this tool.
+
     Args:
-        document_id: UUID of the document to delete
+        document: Document identifier — either a UUID or the exact
+            document name/filename.
 
     Returns:
-        JSON string with deletion confirmation
+        JSON string with deletion confirmation.
     """
     try:
-        logger.info("delete_document_called", document_id=document_id)
+        logger.info("delete_document_called", document=document)
 
-        response = make_backend_request("delete", f"/api/v1/documents/{document_id}")
+        resolved, unresolved = _resolve_document_ids([document])
+        if unresolved or not resolved:
+            return json.dumps({
+                "error": f"Document not found: {document!r}. No UUID or name match.",
+            })
+        document_id = resolved[0]
+
+        make_backend_request("delete", f"/api/v1/documents/{document_id}")
 
         logger.info("delete_document_success", document_id=document_id)
         return json.dumps({
@@ -644,7 +834,7 @@ def delete_document(document_id: str) -> str:
         }, indent=2)
 
     except Exception as e:
-        logger.error(f"delete_document_failed", document_id=document_id, error=str(e))
+        logger.error(f"delete_document_failed", document=document, error=str(e))
         return format_error_for_llm(e, "delete_document")
 
 
