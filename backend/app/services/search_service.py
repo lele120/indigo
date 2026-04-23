@@ -76,9 +76,13 @@ class SearchService:
             # Vector search only
             results = await self._vector_search(query, limit, document_ids, file_type, author, date_from, date_to)
         else:
-            # Hybrid search: Vector + BM25 + RRF
-            vector_results = await self._vector_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
-            bm25_results = await self._bm25_search(query, limit * 2, document_ids, file_type, author, date_from, date_to)
+            # Hybrid search: Vector + BM25 run in parallel, then RRF.
+            # The two paths are independent; awaiting them concurrently
+            # cuts per-query latency roughly in half.
+            vector_results, bm25_results = await asyncio.gather(
+                self._vector_search(query, limit * 2, document_ids, file_type, author, date_from, date_to),
+                self._bm25_search(query, limit * 2, document_ids, file_type, author, date_from, date_to),
+            )
 
             # Reciprocal Rank Fusion
             merged_results = self._reciprocal_rank_fusion(
@@ -311,6 +315,8 @@ class SearchService:
                         "text": full_text,
                         "text_preview": full_text[:200] if full_text else "",
                         "page_number": chunk.page_number,
+                        "chunk_index": chunk.chunk_index,
+                        "section_heading": chunk.section_heading,
                         "chunk_type": chunk.chunk_type,
                         "score": float(score),
                     })

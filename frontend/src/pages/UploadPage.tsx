@@ -76,6 +76,7 @@ export default function UploadPage() {
     onDrop,
     accept: {
       'application/pdf': ['.pdf'],
+      'text/plain': ['.txt'],
     },
     multiple: true,
   })
@@ -96,7 +97,7 @@ export default function UploadPage() {
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-gray-900">Upload Documents</h1>
         <p className="mt-2 text-gray-600">
-          Upload PDF documents to process and index them for semantic search
+          Upload PDF or plain-text documents to process and index them for semantic search
         </p>
       </div>
 
@@ -182,7 +183,7 @@ export default function UploadPage() {
             />
           </svg>
           <p className="mt-4 text-lg text-gray-600">
-            {isDragActive ? 'Drop files here' : 'Drag & drop PDF files here'}
+            {isDragActive ? 'Drop files here' : 'Drag & drop PDF or .txt files here'}
           </p>
           <p className="mt-2 text-sm text-gray-500">or click to select files</p>
         </div>

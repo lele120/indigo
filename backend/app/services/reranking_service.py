@@ -26,10 +26,20 @@ except ImportError:
 
 
 class RerankingService:
-    """Service for reranking search results using cross-encoder models"""
+    """Service for reranking search results using cross-encoder models.
+
+    The cross-encoder model is loaded once per process and cached at class
+    level. Creating multiple RerankingService instances is cheap — they
+    share the same model, which avoids paying the ~10s load cost per
+    request under FastAPI's per-request dependency injection.
+    """
 
     # Lightweight cross-encoder model for reranking
     DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    # Process-wide cache: one entry per model_name. Keeps the reranker
+    # warm across requests so we don't reload a ~90MB model each time.
+    _model_cache: Dict[str, object] = {}
 
     def __init__(self, model_name: str = None):
         """
@@ -39,19 +49,25 @@ class RerankingService:
             model_name: Optional custom model name (defaults to DEFAULT_MODEL)
         """
         self.model_name = model_name or self.DEFAULT_MODEL
-        self._model = None  # Lazy loading
+
+    @property
+    def _model(self):
+        return RerankingService._model_cache.get(self.model_name)
 
     def _load_model(self):
-        """Lazy load cross-encoder model"""
-        if self._model is None:
-            if not SENTENCE_TRANSFORMERS_AVAILABLE:
-                raise ImportError(
-                    "sentence-transformers not installed. "
-                    "Install with: pip install sentence-transformers"
-                )
-            logger.info("loading_cross_encoder_model", model=self.model_name)
-            self._model = CrossEncoder(self.model_name, max_length=512)
-            logger.info("cross_encoder_model_loaded", model=self.model_name)
+        """Load cross-encoder model into the process-wide cache (idempotent)."""
+        if self.model_name in RerankingService._model_cache:
+            return
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                "sentence-transformers not installed. "
+                "Install with: pip install sentence-transformers"
+            )
+        logger.info("loading_cross_encoder_model", model=self.model_name)
+        RerankingService._model_cache[self.model_name] = CrossEncoder(
+            self.model_name, max_length=512
+        )
+        logger.info("cross_encoder_model_loaded", model=self.model_name)
 
     def rerank(
         self,
@@ -85,8 +101,9 @@ class RerankingService:
             return results
 
         try:
-            # Lazy load model
+            # Ensure model is in the process-wide cache (no-op after first call)
             self._load_model()
+            model = self._model
 
             # Prepare query-document pairs
             pairs = []
@@ -95,9 +112,10 @@ class RerankingService:
                 text = result.get("text", result.get("text_preview", ""))
                 pairs.append([query, text])
 
-            # Score with cross-encoder
+            # Score with cross-encoder. Explicit batch_size gives better
+            # CPU utilization than the default batch of 1.
             logger.info("reranking_started", query=query, num_results=len(results))
-            scores = self._model.predict(pairs)
+            scores = model.predict(pairs, batch_size=32, show_progress_bar=False)
 
             # Add cross-encoder scores to results
             for i, result in enumerate(results):

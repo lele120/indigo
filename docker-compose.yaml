@@ -136,6 +136,10 @@ services:
       - "3000:80"
     environment:
       - VITE_BACKEND_URL=http://localhost:8000
+      # Rendered into nginx.conf at container start so /api/* requests
+      # get the Bearer token injected server-side — secret never ships
+      # in the JS bundle.
+      - MCP_API_KEY=${MCP_API_KEY}
     depends_on:
       - backend
 

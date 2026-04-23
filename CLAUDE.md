@@ -236,7 +236,7 @@ The MCP server exposes **8 tools** optimized for LLM consumption:
 3. **search**: Global semantic search (hybrid: vector + BM25 + RRF)
 4. **search_by_tag**: Search filtered by tags (supports match_all for AND logic)
 5. **search_by_document**: Search within specific documents by ID or name
-6. **get_document**: Retrieve full document content by ID (text/markdown/json formats)
+6. **get_document**: Retrieve document by ID. Returns metadata only by default; pass `format` (`text` | `markdown` | `json`) to also return the full content reconstructed from chunks (via `GET /api/v1/documents/{id}/content?format=...`)
 7. **search_with_filters**: Advanced search with combined filters (tags + documents + date range)
 8. **get_statistics**: Knowledge base stats (total docs, chunks, tag distribution, recent uploads)
 

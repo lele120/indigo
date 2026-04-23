@@ -78,7 +78,7 @@ class ApiClient {
 
   // Upload Tasks
   async getTask(taskId: string): Promise<UploadTask> {
-    const { data } = await this.client.get(`/documents/tasks/${taskId}`)
+    const { data } = await this.client.get(`/documents/tasks/${taskId}/status`)
     return data
   }
 

@@ -56,6 +56,8 @@ class SearchResult(BaseModel):
     text: str = Field(..., description="Chunk text content")
     text_preview: str = Field(..., description="Short text preview")
     page_number: Optional[int] = Field(None, description="Page number in document")
+    chunk_index: Optional[int] = Field(None, description="Chunk position in document")
+    section_heading: Optional[str] = Field(None, description="Section or heading title the chunk belongs to")
     chunk_type: str = Field("text", description="Type of chunk")
     rrf_score: Optional[float] = Field(None, description="RRF combined score")
     cross_encoder_score: Optional[float] = Field(None, description="Cross-encoder reranking score")

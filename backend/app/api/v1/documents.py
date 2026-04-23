@@ -13,15 +13,18 @@ Features:
 - Centralized exception handling
 - Transaction management (@transactional)
 """
+from typing import Literal
 from uuid import UUID
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database_async import get_async_db
 from app.managers import DocumentManager, UploadManager, TagManager
 from app.schemas.document import (
+    DocumentContentResponse,
     DocumentResponse,
     DocumentListResponse,
+    DocumentStatsResponse,
     FileUploadResponse,
     TagResponse,
     UploadTaskResponse,
@@ -120,6 +123,17 @@ async def list_documents(
     )
 
 
+@router.get("/stats", response_model=DocumentStatsResponse)
+async def get_document_stats(
+    manager: DocumentManager = Depends(get_document_manager),
+):
+    """
+    Get document statistics: counts by status and all unique tag names.
+    Declared before /{document_id} so "stats" is not parsed as a UUID.
+    """
+    return await manager.get_stats()
+
+
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
     document_id: UUID,
@@ -136,6 +150,26 @@ async def get_document(
     """
     document = await manager.get_document(document_id)
     return DocumentResponse.model_validate(document)
+
+
+@router.get("/{document_id}/content", response_model=DocumentContentResponse)
+async def get_document_content(
+    document_id: UUID,
+    format: Literal["text", "markdown", "json"] = Query(
+        "markdown",
+        description="Output format: plain text, markdown (default), or structured JSON chunks",
+    ),
+    manager: DocumentManager = Depends(get_document_manager),
+):
+    """
+    Get full document content reconstructed from chunks.
+
+    Formats:
+    - markdown (default): chunks joined with blank lines, markdown preserved
+    - text: markdown syntax stripped
+    - json: structured list with chunk_index, page_number, section_heading, text
+    """
+    return await manager.get_document_content(document_id, format)
 
 
 @router.put("/{document_id}", response_model=DocumentResponse)

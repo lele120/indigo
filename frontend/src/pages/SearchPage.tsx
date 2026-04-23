@@ -5,6 +5,31 @@ import apiClient from '@/api/client'
 import type { SearchResult } from '@/types'
 import { formatDuration } from '@/utils/format'
 
+const PREVIEW_LIMIT = 420
+
+// Strip Markdown syntax and normalize whitespace for plain-text rendering.
+function cleanText(raw: string): string {
+  if (!raw) return ''
+  return raw
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/\|/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+}
+
+function truncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  return text.slice(0, maxChars).replace(/\s+\S*$/, '') + '…'
+}
+
 export default function SearchPage() {
   const [query, setQuery] = useState('')
   const [useHybrid, setUseHybrid] = useState(true)
@@ -12,6 +37,16 @@ export default function SearchPage() {
   const [results, setResults] = useState<SearchResult[]>([])
   const [searchTime, setSearchTime] = useState<number | null>(null)
   const [totalResults, setTotalResults] = useState<number>(0)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  const toggleExpanded = (key: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   const searchMutation = useMutation({
     mutationFn: (searchQuery: string) =>
@@ -24,6 +59,7 @@ export default function SearchPage() {
       setResults(data.results)
       setSearchTime(data.search_time_ms)
       setTotalResults(data.total)
+      setExpanded(new Set())
     },
   })
 
@@ -144,25 +180,35 @@ export default function SearchPage() {
                   >
                     {result.document_name}
                   </Link>
-                  {result.page_number && (
+                  {result.page_number != null && (
                     <span className="ml-2 text-sm text-gray-500">
                       Page {result.page_number}
                     </span>
                   )}
+                  {result.section_heading && (
+                    <div className="mt-1 text-sm text-gray-600 italic">
+                      § {result.section_heading}
+                    </div>
+                  )}
                 </div>
                 <div className="ml-4 text-right">
                   <div className="text-xs text-gray-500 space-y-1">
-                    {result.rrf_score !== undefined && (
+                    {result.cross_encoder_score != null && (
                       <div>
-                        RRF: <span className="font-medium text-gray-900">{result.rrf_score.toFixed(4)}</span>
+                        Rerank: <span className="font-medium text-gray-900">{result.cross_encoder_score.toFixed(3)}</span>
                       </div>
                     )}
-                    {result.vector_score !== undefined && (
+                    {result.rrf_score != null && (
+                      <div>
+                        RRF: <span className="font-medium text-gray-700">{result.rrf_score.toFixed(4)}</span>
+                      </div>
+                    )}
+                    {result.vector_score != null && (
                       <div>
                         Vector: <span className="font-medium text-gray-700">{result.vector_score.toFixed(4)}</span>
                       </div>
                     )}
-                    {result.bm25_score !== undefined && result.bm25_score !== null && (
+                    {result.bm25_score != null && (
                       <div>
                         BM25: <span className="font-medium text-gray-700">{result.bm25_score.toFixed(4)}</span>
                       </div>
@@ -171,11 +217,35 @@ export default function SearchPage() {
                 </div>
               </div>
 
-              <p className="text-gray-700 leading-relaxed">{result.text_preview}</p>
+              {(() => {
+                const key = `${result.chunk_id}-${index}`
+                const full = cleanText(result.text || result.text_preview)
+                const isLong = full.length > PREVIEW_LIMIT
+                const isExpanded = expanded.has(key)
+                const display = !isLong || isExpanded ? full : truncate(full, PREVIEW_LIMIT)
+                return (
+                  <>
+                    <p className="text-gray-700 leading-relaxed whitespace-pre-line">{display}</p>
+                    {isLong && (
+                      <button
+                        type="button"
+                        onClick={() => toggleExpanded(key)}
+                        className="mt-2 text-sm font-medium text-primary-600 hover:text-primary-800"
+                      >
+                        {isExpanded ? 'Show less' : `Show full chunk (${full.length} chars)`}
+                      </button>
+                    )}
+                  </>
+                )
+              })()}
 
               <div className="mt-3 flex items-center space-x-4 text-sm text-gray-500">
-                <span>Chunk #{result.chunk_index + 1}</span>
-                <span>•</span>
+                {result.chunk_index != null && (
+                  <>
+                    <span>Chunk #{result.chunk_index + 1}</span>
+                    <span>•</span>
+                  </>
+                )}
                 <Link
                   to={`/documents/${result.document_id}`}
                   className="text-primary-600 hover:text-primary-800 font-medium"

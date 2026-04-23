@@ -17,6 +17,7 @@ import hashlib
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
+import shutil
 
 from app.core.transactions import transactional
 from app.core.exceptions import (
@@ -128,126 +129,119 @@ class UploadManager:
         return sha256.hexdigest()
 
     async def _save_temp_file(self, file: UploadFile) -> str:
-        """Save uploaded file to temporary location (Business logic)"""
+        """Save uploaded file to temporary location (Business logic).
+
+        Writes to /tmp/uploads which is a shared Docker volume also mounted
+        into the Celery worker container, so the worker can read the file.
+        """
         file_ext = os.path.splitext(file.filename)[1]
+        upload_dir = "/tmp/uploads"
+        os.makedirs(upload_dir, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=file_ext
+            suffix=file_ext,
+            dir=upload_dir,
         )
 
         try:
             file.file.seek(0)
-            content = await file.read()
-            temp_file.write(content)
+            shutil.copyfileobj(file.file, temp_file)
             temp_file.flush()
             logger.info("temp_file_saved", path=temp_file.name)
             return temp_file.name
         finally:
             temp_file.close()
 
-    @transactional
     async def upload_document(
         self,
         file: UploadFile,
         request: UploadDocumentRequest
     ) -> FileUploadResponse:
-        """
-        Handle complete document upload workflow (Business orchestration)
+        """Orchestrate the full upload workflow.
 
-        Steps:
-        1. Validate file (business logic)
-        2. Calculate hash and check duplicates (via DocumentService)
-        3. Save to temp location (business logic)
-        4. Create document record (via DocumentService)
-        5. Add tags (via TagService)
-        6. Create upload task (via UploadTaskService)
-        7. Queue async processing (business logic)
-
-        Args:
-            file: Uploaded file
-            request: Upload parameters (tags, chunk_size, etc.)
-
-        Returns:
-            FileUploadResponse with document_id and task_id
-
-        Raises:
-            InvalidFileException: Invalid file
-            DuplicateDocumentException: File already exists
+        Persists the document + task inside a single transaction, then queues
+        the Celery job only AFTER the commit is visible. This avoids the
+        race where the worker picks up the task and queries Postgres before
+        the producing transaction has committed — which surfaced as
+        intermittent "Document X not found" failures.
         """
         logger.info("upload_started", filename=file.filename)
 
-        # Step 1: Validate file
         await self._validate_file(file)
-
-        # Step 2: Calculate hash and check duplicates
         file_hash = await self._calculate_hash(file)
 
-        # Check for duplicate via service
         existing_doc = await self.document_service.get_by_hash(file_hash)
         if existing_doc and existing_doc.name == file.filename:
             raise DuplicateDocumentException(file.filename, file_hash)
 
-        # Step 3: Save to temp location
         temp_path = await self._save_temp_file(file)
 
         try:
-            # Step 4: Create document record via service
-            file.file.seek(0, 2)
-            file_size = file.file.tell()
-
-            document_create = DocumentCreate(
-                name=file.filename,
-                file_hash=file_hash,
-                file_size=file_size,
-                mime_type=file.content_type or "application/octet-stream",
-                tags=request.tags if request.tags else None
+            document_id, task_id = await self._persist_document_records(
+                file, request, file_hash
             )
-
-            document = await self.document_service.create(document_create)
-
-            # Step 5: Add tags if provided (via TagService)
-            if request.tags:
-                for tag_name in request.tags:
-                    tag = await self.tag_service.get_or_create(tag_name)
-                    document.tags.append(tag)
-
-            await self.db.flush()  # Ensure tags are associated
-
-            # Step 6: Create upload task via service
-            task = await self.upload_task_service.create(document.id)
-
-            # Transaction commits here automatically via @transactional
-
-            logger.info(
-                "document_created",
-                document_id=str(document.id),
-                task_id=str(task.id),
-                filename=file.filename
-            )
-
-            # Step 7: Queue async processing (outside transaction)
-            process_document.delay(
-                str(document.id),
-                str(task.id),
-                temp_path,
-                request.chunk_size,
-                request.chunk_overlap
-            )
-
-            return FileUploadResponse(
-                document_id=str(document.id),
-                task_id=str(task.id),
-                message=f"Document '{file.filename}' uploaded successfully. Processing started.",
-            )
-
-        except Exception as e:
-            # Clean up temp file on error
+        except Exception:
+            # Transactional step failed — clean up the temp file we already
+            # staged on the shared volume.
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            logger.error(
-                "upload_failed",
-                filename=file.filename,
-                error=str(e),
-                exc_info=True
-            )
             raise
+
+        # Transaction has committed at this point. The Celery worker can now
+        # safely query Postgres for document_id / task_id without racing.
+        process_document.delay(
+            str(document_id),
+            str(task_id),
+            temp_path,
+            request.chunk_size,
+            request.chunk_overlap,
+        )
+
+        return FileUploadResponse(
+            document_id=str(document_id),
+            task_id=str(task_id),
+            message=f"Document '{file.filename}' uploaded successfully. Processing started.",
+        )
+
+    @transactional
+    async def _persist_document_records(
+        self,
+        file: UploadFile,
+        request: UploadDocumentRequest,
+        file_hash: str,
+    ):
+        """Create the Document + UploadTask rows in a single committed txn.
+
+        Tag ORM objects are resolved and attached before the document enters
+        the session (transient assignment) to avoid async lazy-load issues.
+        """
+        file.file.seek(0, 2)
+        file_size = file.file.tell()
+
+        document_create = DocumentCreate(
+            name=file.filename,
+            file_hash=file_hash,
+            file_size=file_size,
+            mime_type=file.content_type or "application/octet-stream",
+            tags=request.tags if request.tags else None,
+        )
+
+        tag_objects = []
+        if request.tags:
+            for tag_name in request.tags:
+                tag = await self.tag_service.get_or_create(tag_name)
+                tag_objects.append(tag)
+
+        document = await self.document_service.create(
+            document_create,
+            tags=tag_objects or None,
+        )
+        task = await self.upload_task_service.create(document.id)
+
+        logger.info(
+            "document_created",
+            document_id=str(document.id),
+            task_id=str(task.id),
+            filename=file.filename,
+        )
+        return document.id, task.id

@@ -39,10 +39,14 @@ mcp = FastMCP("Indigo Document Intelligence")
 
 # HTTP Client with authentication and retry logic
 def get_client() -> httpx.Client:
-    """Get authenticated HTTP client with timeout configuration"""
+    """Get authenticated HTTP client with timeout configuration.
+
+    The backend now enforces Bearer auth on /api/v1/*, so every MCP->backend
+    request carries the shared MCP_API_KEY as a Bearer token.
+    """
     headers = {}
     if MCP_API_KEY:
-        headers["X-API-Key"] = MCP_API_KEY
+        headers["Authorization"] = f"Bearer {MCP_API_KEY}"
 
     return httpx.Client(
         base_url=BACKEND_URL,
@@ -296,103 +300,233 @@ def list_tags() -> str:
 
 @mcp.tool()
 def search_by_tag(
-    tags: str,
-    page: int = 1,
-    page_size: int = 10,
+    query: str,
+    tags: List[str],
+    match_all: bool = False,
+    limit: int = 10,
+    use_hybrid: bool = True,
 ) -> str:
     """
-    Search documents by tags.
+    Perform semantic search restricted to documents that carry one or more of the given tags.
+
+    Use this when the agent needs to scope a question to a domain (e.g. only
+    "compliance" docs, or docs tagged both "compliance" AND "privacy").
 
     Args:
-        tags: Comma-separated tags to search for
-        page: Page number (default: 1)
-        page_size: Number of documents per page (default: 10, max: 100)
+        query: Search query text (required).
+        tags: List of tag names to filter by (at least one required).
+        match_all: If true, only documents tagged with ALL listed tags are searched.
+                   If false (default), documents with ANY of the tags are searched.
+        limit: Maximum results to return (default 10, max 100).
+        use_hybrid: Hybrid vector + BM25 retrieval with reranking (default true).
 
     Returns:
-        JSON string with documents matching the tags
+        JSON string with ranked search results (same shape as `search`), plus a
+        `_filter` block reporting the resolved document set size.
     """
     try:
-        logger.info("search_by_tag_called", tags=tags)
+        logger.info("search_by_tag_called", query=query, tags=tags, match_all=match_all)
 
-        params = {
+        if not tags:
+            return format_error_for_llm(
+                ValueError("at least one tag is required"),
+                "search_by_tag",
+            )
+
+        # Resolve each tag -> set of document IDs via the backend listing.
+        doc_id_sets: List[set] = []
+        for tag in tags:
+            resp = make_backend_request(
+                "get",
+                "/api/v1/documents",
+                params={"tag": tag, "page_size": 100},
+            )
+            items = resp.json().get("items", [])
+            doc_id_sets.append({d["id"] for d in items})
+
+        if match_all:
+            matching_ids = set.intersection(*doc_id_sets) if doc_id_sets else set()
+        else:
+            matching_ids = set.union(*doc_id_sets) if doc_id_sets else set()
+
+        if not matching_ids:
+            return json.dumps(
+                {
+                    "query": query,
+                    "results": [],
+                    "total": 0,
+                    "use_hybrid": use_hybrid,
+                    "_filter": {"tags": tags, "match_all": match_all, "matching_doc_count": 0},
+                    "note": f"No documents match tags {tags} (match_all={match_all}).",
+                },
+                indent=2,
+            )
+
+        payload = {
+            "query": query,
+            "limit": min(limit, 100),
+            "use_hybrid": use_hybrid,
+            "document_ids": list(matching_ids),
+        }
+        resp = make_backend_request("post", "/api/v1/search", json=payload)
+        data = resp.json()
+        data["_filter"] = {
             "tags": tags,
-            "page": page,
-            "page_size": min(page_size, 100),
+            "match_all": match_all,
+            "matching_doc_count": len(matching_ids),
         }
 
-        response = make_backend_request("get", "/api/v1/documents", params=params)
-        data = response.json()
-
-        logger.info("search_by_tag_success", count=data.get("total", 0))
+        logger.info("search_by_tag_success", results=data.get("total", 0), doc_count=len(matching_ids))
         return json.dumps(data, indent=2)
 
     except Exception as e:
-        logger.error(f"search_by_tag_failed", error=str(e))
+        logger.error("search_by_tag_failed", error=str(e))
         return format_error_for_llm(e, "search_by_tag")
 
 
 @mcp.tool()
 def search_by_document(
     query: str,
-    document_ids: str,
+    documents: List[str],
     limit: int = 10,
     use_hybrid: bool = True,
 ) -> str:
     """
     Perform semantic search restricted to one or more specific documents.
 
+    Accepts a mix of document UUIDs and document names/filenames. Names are
+    resolved to UUIDs against the current document set; unknown names are
+    dropped with a warning in the response.
+
     Args:
-        query: Search query text (required)
-        document_ids: Comma-separated document IDs or names to search within (required)
-        limit: Maximum number of results (default: 10, max: 100)
-        use_hybrid: Use hybrid search (vector + BM25) or vector only (default: true)
+        query: Search query text (required).
+        documents: List of document identifiers — each item may be a UUID or a
+                   document name (e.g. "nist-cybersecurity-framework-1.1.pdf").
+                   At least one required.
+        limit: Maximum results (default 10, max 100).
+        use_hybrid: Hybrid vector + BM25 retrieval with reranking (default true).
 
     Returns:
-        JSON string with search results from specified documents only
+        JSON string with ranked search results scoped to the resolved documents.
     """
     try:
-        logger.info("search_by_document_called", query=query, document_ids=document_ids)
+        logger.info("search_by_document_called", query=query, documents=documents)
+
+        if not documents:
+            return format_error_for_llm(
+                ValueError("at least one document is required"),
+                "search_by_document",
+            )
+
+        import re
+        uuid_pat = re.compile(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            re.IGNORECASE,
+        )
+        resolved_ids: List[str] = []
+        unresolved: List[str] = []
+        name_candidates: List[str] = []
+        for d in documents:
+            d = (d or "").strip()
+            if not d:
+                continue
+            if uuid_pat.match(d):
+                resolved_ids.append(d)
+            else:
+                name_candidates.append(d)
+
+        if name_candidates:
+            # Single listing call, then look up each name locally.
+            resp = make_backend_request(
+                "get", "/api/v1/documents", params={"page_size": 100}
+            )
+            items = resp.json().get("items", [])
+            name_to_id = {d["name"]: d["id"] for d in items}
+            for name in name_candidates:
+                if name in name_to_id:
+                    resolved_ids.append(name_to_id[name])
+                else:
+                    unresolved.append(name)
+
+        if not resolved_ids:
+            return json.dumps(
+                {
+                    "query": query,
+                    "results": [],
+                    "total": 0,
+                    "use_hybrid": use_hybrid,
+                    "note": f"No documents matched identifiers {documents}.",
+                    "unresolved": unresolved,
+                },
+                indent=2,
+            )
 
         payload = {
             "query": query,
             "limit": min(limit, 100),
             "use_hybrid": use_hybrid,
-            "document_ids": [did.strip() for did in document_ids.split(",")],
+            "document_ids": resolved_ids,
+        }
+        resp = make_backend_request("post", "/api/v1/search", json=payload)
+        data = resp.json()
+        data["_filter"] = {
+            "resolved_document_count": len(resolved_ids),
+            "unresolved_names": unresolved,
         }
 
-        response = make_backend_request("post", "/api/v1/search", json=payload)
-        data = response.json()
-
-        logger.info("search_by_document_success", results_count=data.get("total", 0))
+        logger.info(
+            "search_by_document_success",
+            results=data.get("total", 0),
+            resolved=len(resolved_ids),
+        )
         return json.dumps(data, indent=2)
 
     except Exception as e:
-        logger.error(f"search_by_document_failed", error=str(e))
+        logger.error("search_by_document_failed", error=str(e))
         return format_error_for_llm(e, "search_by_document")
 
 
 @mcp.tool()
-def get_document(document_id: str) -> str:
+def get_document(document_id: str, format: Optional[str] = None) -> str:
     """
-    Get a specific document by ID.
+    Get a document by ID.
 
     Args:
         document_id: UUID of the document
+        format: If provided, returns full reconstructed content in the given
+            format: "text" (markdown stripped), "markdown" (preserves headings
+            and tables, best for LLMs), or "json" (structured list of chunks
+            with chunk_index, page_number, section_heading, text).
+            If omitted, only metadata is returned (fast, no chunk load).
 
     Returns:
-        JSON string with document details including chunks and metadata
+        JSON string with document metadata, or metadata + full content when
+        format is specified.
     """
     try:
-        logger.info("get_document_called", document_id=document_id)
+        logger.info("get_document_called", document_id=document_id, format=format)
 
-        response = make_backend_request("get", f"/api/v1/documents/{document_id}")
+        if format is None:
+            response = make_backend_request(
+                "get", f"/api/v1/documents/{document_id}"
+            )
+        else:
+            if format not in ("text", "markdown", "json"):
+                return json.dumps({
+                    "error": f"Invalid format: {format!r}. Must be one of: text, markdown, json"
+                })
+            response = make_backend_request(
+                "get",
+                f"/api/v1/documents/{document_id}/content",
+                params={"format": format},
+            )
+
         data = response.json()
-
-        logger.info("get_document_success", document_id=document_id)
+        logger.info("get_document_success", document_id=document_id, format=format)
         return json.dumps(data, indent=2)
 
     except Exception as e:
-        logger.error(f"get_document_failed", document_id=document_id, error=str(e))
+        logger.error("get_document_failed", document_id=document_id, error=str(e))
         return format_error_for_llm(e, "get_document")
 
 
@@ -526,26 +660,23 @@ def get_stats() -> str:
     try:
         logger.info(f"{operation}_called")
 
-        stats = {}
+        # Single backend call to the authoritative stats endpoint — the
+        # previous implementation looped over /documents?status=X, but
+        # ListDocumentsRequest has no `status` filter, so every call
+        # returned the full total and all counters collapsed to the same
+        # number.
+        stats_resp = make_backend_request("get", "/api/v1/documents/stats")
+        s = stats_resp.json()
 
-        # Get total documents count
-        response = make_backend_request("get", "/api/v1/documents", params={"page": 1, "page_size": 1})
-        stats["total_documents"] = response.json().get("total", 0)
-
-        # Get documents by status
-        for status in ["pending", "processing", "completed", "failed"]:
-            response = make_backend_request(
-                "get",
-                "/api/v1/documents",
-                params={"page": 1, "page_size": 1, "status": status}
-            )
-            stats[f"documents_{status}"] = response.json().get("total", 0)
-
-        # Get all tags
-        response = make_backend_request("get", "/api/v1/documents/tags/all")
-        tags_data = response.json()  # Returns list directly
-        stats["total_tags"] = len(tags_data)
-        stats["tags"] = [tag.get("name") for tag in tags_data]
+        stats = {
+            "total_documents": s.get("total", 0),
+            "documents_pending": s.get("pending", 0),
+            "documents_processing": s.get("processing", 0),
+            "documents_completed": s.get("completed", 0),
+            "documents_failed": s.get("failed", 0),
+            "tags": s.get("tags", []),
+            "total_tags": len(s.get("tags", [])),
+        }
 
         logger.info(f"{operation}_success", total_documents=stats["total_documents"])
         return json.dumps(stats, indent=2)

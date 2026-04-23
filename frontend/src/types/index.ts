@@ -61,12 +61,15 @@ export interface SearchResult {
   chunk_id: string
   document_id: string
   document_name: string
-  chunk_index: number
+  chunk_index: number | null
   page_number: number | null
+  section_heading: string | null
+  text: string
   text_preview: string
   rrf_score?: number
   vector_score?: number
   bm25_score?: number
+  cross_encoder_score?: number
 }
 
 export interface SearchResponse {
