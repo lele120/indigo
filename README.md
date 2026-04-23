@@ -2,6 +2,55 @@
 
 RAG (Retrieval-Augmented Generation) system with MCP (Model Context Protocol) server for semantic document search.
 
+## Specification Compliance
+
+Mapping between the assignment brief (`specification.txt`) and this
+implementation. All mandatory requirements and both bonus items are covered.
+
+### A. Document Management — Frontend
+| Requirement | Implementation |
+|---|---|
+| Upload PDF and plain text | `frontend/src/pages/UploadPage.tsx` accepts `application/pdf` and `text/plain` (`.txt`) |
+| Assign one or more tags at upload | Tag chips on the upload form, persisted via `document_tags` join table |
+| List documents with tags | `DocumentsPage.tsx` → `GET /api/v1/documents` |
+| Delete a document | Delete action → `DELETE /api/v1/documents/{id}` (cascades chunks + Qdrant points) |
+
+### B. Ingestion Pipeline — Backend
+| Requirement | Implementation |
+|---|---|
+| Parse and extract text | PyMuPDF4LLM (PDF → Markdown, preserves tables/headings/multi-column); plain `.txt` pass-through |
+| Chunk into meaningful segments | LangChain `RecursiveCharacterTextSplitter` — 1000 tokens, 200 overlap, `cl100k_base` tokenizer; splits on `\n\n` → `\n` → `. ` → ` ` |
+| Embed each chunk | OpenAI `text-embedding-3-small` (1536 dims), batched by 100 |
+| Store chunks + embeddings | Qdrant collection `documents` via gRPC; point ID = `document_id + chunk_index` for idempotent upsert |
+| Persist document metadata | PostgreSQL 16 (tables: `documents`, `tags`, `document_tags`, `chunks`, `upload_tasks`) |
+| Deduplication on re-upload | Composite key `(filename, SHA256 hash)` — same file+name triggers UPDATE, not duplicate INSERT |
+
+### C. MCP Server — Core
+| Requirement | Implementation |
+|---|---|
+| Python | FastMCP (`mcp/server.py`) + FastAPI wrapper (`mcp/main.py`) |
+| Streamable HTTP transport | `FastMCP.http_app(transport='streamable-http')` mounted at `/mcp`; REST shim (`/tools`, `/call-tool`) kept for curl/testing |
+| `list_documents` | ✓ pagination (`limit`, `offset`) |
+| `list_tags` | ✓ |
+| `search` | ✓ hybrid (vector + BM25 + RRF + reranker) with `top_k`, `min_score` |
+| `search_by_tag` | ✓ with `match_all` for AND vs OR semantics |
+| `search_by_document` | ✓ accepts document IDs **or** names |
+| Additional tools | `get_document` (+ content reconstruction via `format=text\|markdown\|json`), `upload_document`, `update_document`, `delete_document`, `get_stats` — 10 total |
+| Bearer token auth | `Authorization: Bearer <MCP_API_KEY>` enforced on every tool call |
+
+### Bonus — both implemented
+| Bonus | Implementation |
+|---|---|
+| Hybrid search + reranking | Dense vectors + BM25 (Markdown stripped), fused with Reciprocal Rank Fusion (k=60), then cross-encoder reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`). +30–40% recall@10 vs vector-only. Toggle via `ENABLE_HYBRID_SEARCH` / `ENABLE_RERANKING` |
+| Chunk-level provenance | Every search result exposes `page_number`, `section_heading`, `source_document`, `chunk_id`. Section headings extracted from Markdown `#…######` or PyMuPDF4LLM TOC |
+
+### Deliverables checklist
+- `.env.example` ✓
+- `docker-compose.yaml` — single-command stack ✓
+- MCP server with auth, documented ✓
+- README with architecture, stack rationale, tool design, run/connect instructions ✓
+- Part 1 answers in [`PART1.md`](./PART1.md) ✓
+
 ## Architecture
 
 ### System Overview
@@ -268,7 +317,7 @@ async def get_by_id(self, document_id: UUID) -> Optional[Document]:
 
 - **Controllers**: 80% size reduction (220 → 40 lines avg)
 - **Docker builds**: 95% faster (10min → 30sec incremental)
-- **Test coverage**: 37 tests covering core functionality
+- **Test coverage**: 46 unit tests across 4 service-layer suites (chunking, pdf, document, search)
 - **Files refactored**: 14 files, +1,933 lines, -991 lines
 - **Architecture**: All services, managers, controllers now async
 
@@ -378,26 +427,43 @@ npm run build
 
 ## Testing
 
-**Note**: Test infrastructure is configured but test suites are not yet implemented. See "Known Limitations" section.
+**Backend** ships with 46 unit tests across 4 service-layer suites
+(chunking, PDF parsing, document CRUD, search). Frontend and E2E suites
+are not yet implemented — see "Known Limitations".
 
 ```bash
-# Backend tests (configured but empty)
+# Run backend tests (inside the backend container or a venv)
 cd backend
-pytest
+pytest                                    # all suites
+pytest tests/test_search_service.py -v    # single suite
 
-# Frontend tests (configured but empty)
-cd frontend
-npm test
-
-# E2E tests (planned)
-npm run test:e2e
+# Run backend tests from Docker
+docker-compose exec backend pytest
 ```
+
+Test files:
+- `backend/tests/test_chunking_service.py` (14 tests) — chunking strategy, overlap, Markdown stripping
+- `backend/tests/test_document_service.py` (13 tests) — async CRUD, deduplication, tag handling
+- `backend/tests/test_pdf_service.py` (11 tests) — PyMuPDF4LLM extraction, page metadata
+- `backend/tests/test_search_service.py` (8 tests) — vector + BM25 + RRF + reranker
 
 ## API Documentation
 
 Once services are running:
 - Backend API docs: http://localhost:8000/docs
 - Backend ReDoc: http://localhost:8000/redoc
+
+### Notable backend endpoints
+
+- `POST /api/v1/documents/upload` — upload PDF/TXT with tags, returns `document_id` + `task_id`
+- `GET /api/v1/documents` — paginated list with tags
+- `GET /api/v1/documents/{id}` — metadata only (fast path)
+- `GET /api/v1/documents/{id}/content?format=text|markdown|json` — full content reconstructed from chunks; `json` preserves per-chunk boundaries and provenance (chunk_index, page_number, section_heading)
+- `GET /api/v1/documents/upload/{task_id}/status` — progress (0-100%) for async ingestion
+- `PUT /api/v1/documents/{id}` — update name and/or tags
+- `DELETE /api/v1/documents/{id}` — delete document, chunks, Qdrant points (single transaction)
+- `POST /api/v1/search` — hybrid search with optional tag/document/date filters
+- `GET /metrics` — Prometheus exposition
 
 ## MCP Tools
 
@@ -408,7 +474,7 @@ The MCP server exposes **10 tools** via Streamable HTTP (port 8001):
 3. **list_tags** - List all unique tags in the system
 4. **search_by_tag** - Filter documents by tags
 5. **search_by_document** - Search within specific document(s)
-6. **get_document** - Get full document details with chunks
+6. **get_document** - Get document metadata by ID. Pass `format=text|markdown|json` to also return the full content reconstructed from chunks (via `GET /api/v1/documents/{id}/content?format=...`). `json` preserves chunk boundaries + provenance (chunk_index, page_number, section_heading) for citation use cases.
 7. **upload_document** - Upload and process new PDF documents
 8. **update_document** - Update document metadata (name, tags)
 9. **delete_document** - Delete document and associated data
@@ -520,23 +586,27 @@ For AI assistants or MCP clients, configure with:
 
 ```
 .
-├── backend/           # FastAPI backend
+├── backend/                   # FastAPI backend (3-layer async)
 │   ├── app/
-│   │   ├── api/      # API endpoints
-│   │   ├── core/     # Config, database
-│   │   ├── models/   # SQLAlchemy models
-│   │   ├── services/ # Business logic
-│   │   ├── tasks/    # Celery tasks
-│   │   └── ingestion/# PDF processing
-│   ├── alembic/      # Database migrations
+│   │   ├── api/v1/            # Controllers (thin HTTP layer)
+│   │   ├── managers/          # Business logic + @transactional
+│   │   ├── services/          # Data access (async SQLAlchemy, Qdrant, OpenAI)
+│   │   ├── schemas/           # Pydantic request/response schemas
+│   │   ├── models/            # SQLAlchemy ORM models
+│   │   ├── core/              # Config, database_async, exceptions, transactions
+│   │   ├── ingestion/         # PDF/DOCX/XLSX parsing
+│   │   └── tasks/             # Celery background tasks
+│   ├── alembic/               # Database migrations
+│   └── tests/                 # 46 unit tests
+├── mcp/
+│   ├── server.py              # FastMCP tool definitions (10 tools)
+│   ├── main.py                # FastAPI wrapper: Streamable HTTP + REST shim
 │   └── tests/
-├── mcp/              # MCP server
-│   ├── app/
-│   └── tests/
-├── frontend/         # React frontend
-│   └── src/
-├── data/             # Persistent data
-└── docker-compose.yaml
+├── frontend/                  # React + Vite + Tailwind + Zustand
+│   └── src/pages/             # UploadPage, DocumentsPage, SearchPage, DocumentDetailPage
+├── scripts/
+│   └── download-samples.sh    # Fetches NIST demo corpus into samples/
+└── docker-compose.yaml        # 8-service stack
 ```
 
 ## Features
@@ -622,9 +692,9 @@ See `.env.example` for full list. Key variables:
 **Medium-term (1 week):**
 - Multi-format support testing (DOCX via python-docx, XLSX via openpyxl)
 - Image OCR pipeline (PaddleOCR for text extraction + CLIP for image embeddings)
-- Cross-encoder re-ranking as optional feature (cache results in Redis)
 - User authentication with role-based access control (admin vs read-only)
 - Distributed task queue setup (multiple Celery workers with auto-scaling)
+- BM25 index warming on startup (currently first search pays a 2–5s cold-start cost)
 
 **Long-term (1 month):**
 - Migrate BM25 to Elasticsearch for scalability (sparse vectors + full-text search)
