@@ -34,8 +34,8 @@ implementation. All mandatory requirements and both bonus items are covered.
 | `list_tags` | ✓ |
 | `search` | ✓ hybrid (vector + BM25 + RRF + reranker) with `top_k`, `min_score` |
 | `search_by_tag` | ✓ with `match_all` for AND vs OR semantics |
-| `search_by_document` | ✓ accepts document IDs **or** names |
-| Additional tools | `get_document` (+ content reconstruction via `format=text\|markdown\|json`), `upload_document`, `update_document`, `delete_document`, `get_stats` — 10 total |
+| `search_by_document` | ✓ accepts document UUIDs **or** filenames (auto-resolved) |
+| Additional tools | `search_with_filters` (combined tag ∩ document filter), `get_document` (+ content reconstruction via `format=text\|markdown\|json`), `upload_document` (PDF + .txt), `update_document` / `delete_document` (accept UUID or filename), `get_stats` — **11 total** |
 | Bearer token auth | `Authorization: Bearer <MCP_API_KEY>` enforced on every tool call |
 
 ### Bonus — both implemented
@@ -467,59 +467,68 @@ Once services are running:
 
 ## MCP Tools
 
-The MCP server exposes **10 tools** via Streamable HTTP (port 8001):
+The MCP server exposes **11 tools** via Streamable HTTP (port 8001):
 
-1. **list_documents** - List all documents with pagination and filtering
-2. **search** - Hybrid semantic search (vector + BM25 with RRF)
-3. **list_tags** - List all unique tags in the system
-4. **search_by_tag** - Filter documents by tags
-5. **search_by_document** - Search within specific document(s)
-6. **get_document** - Get document metadata by ID. Pass `format=text|markdown|json` to also return the full content reconstructed from chunks (via `GET /api/v1/documents/{id}/content?format=...`). `json` preserves chunk boundaries + provenance (chunk_index, page_number, section_heading) for citation use cases.
-7. **upload_document** - Upload and process new PDF documents
-8. **update_document** - Update document metadata (name, tags)
-9. **delete_document** - Delete document and associated data
-10. **get_stats** - System statistics and health metrics
+1. **list_documents** — paginated list with filters (`status`, `tags`, `search` on name)
+2. **search** — global hybrid semantic search (vector + BM25 + RRF + cross-encoder reranking)
+3. **list_tags** — all unique tags in the knowledge base
+4. **search_by_tag** — search scoped by tags, with `match_all` (AND) vs ANY semantics
+5. **search_by_document** — search scoped by document UUIDs **or** filenames (names auto-resolved)
+6. **search_with_filters** — combined filter: `tags` ∩ `documents` in a single call (avoids tool chaining)
+7. **get_document** — metadata by ID. Pass `format=text|markdown|json` to also return the full content reconstructed from chunks. `json` preserves per-chunk boundaries + provenance (chunk_index, page_number, section_heading) for citation use cases
+8. **upload_document** — upload a **PDF or plain-text (.txt)** file with optional tags; MIME type auto-detected
+9. **update_document** — update name and/or tags; accepts UUID **or** filename
+10. **delete_document** — destructive: removes document, chunks, vectors, upload tasks; accepts UUID **or** filename
+11. **get_stats** — system statistics (doc counts by status, tag list)
 
 ### MCP Tool Design Rationale
 
-**Why 10 tools instead of the required 5?**
+**Why 11 tools instead of the required 5?**
 
-The specification required 5 tools (`list_documents`, `list_tags`, `search`, `search_by_tag`, `search_by_document`). I added 5 more to provide complete lifecycle management:
+The specification required 5 tools (`list_documents`, `list_tags`, `search`, `search_by_tag`, `search_by_document`). I added 6 more to cover the full document lifecycle and reduce tool chaining:
 
-- **Discovery tools** (`list_documents`, `list_tags`, `get_stats`): Help agents understand the knowledge base structure before querying
-- **Search variants** (`search`, `search_by_tag`, `search_by_document`): Provide precision vs recall tradeoffs—agents can start broad and narrow down
-- **CRUD tools** (`upload_document`, `update_document`, `delete_document`, `get_document`): Enable agents to manage documents autonomously, not just read
+- **Discovery tools** (`list_documents`, `list_tags`, `get_stats`): help agents understand the knowledge base before querying
+- **Search variants** (`search`, `search_by_tag`, `search_by_document`, `search_with_filters`): precision vs recall tradeoffs — agents can start broad and narrow down, or combine filters in a single call
+- **CRUD tools** (`upload_document`, `update_document`, `delete_document`, `get_document`): enable agents to manage documents autonomously, not just read
 
 **Design Philosophy:**
 
 1. **Tool Naming**: Verb-first (`list_`, `search_`, `get_`, `update_`) makes intent clear to LLMs. Avoids ambiguous names like `documents()` (list or search?)
 
-2. **Parameter Defaults**: Optimized for conversational AI:
-   - `limit=10` (default): Fits ~5-10 chunks in typical LLM context window
-   - `use_hybrid=true`: Provides +30-40% better recall than vector-only
-   - `page_size=10`: Balances detail vs overwhelming the agent
+2. **Parameter Defaults**: optimized for conversational AI:
+   - `limit=10`: fits ~5–10 chunks in typical LLM context window
+   - `use_hybrid=true`: +30–40% recall vs vector-only
+   - `page_size=10`: balances detail vs overwhelming the agent
 
-3. **Input Schema Simplicity**: Used comma-separated strings (`tags="ai,research"`) instead of JSON arrays for tag lists. Why? LLMs often struggle with nested JSON in tool calls; flat strings reduce errors.
+3. **Parameter Shape Consistency**: lists of tags / document identifiers are typed as **JSON arrays** (`List[str]`) throughout the API — never comma-separated strings. This is uniform across `list_documents`, `search_by_tag`, `search_by_document`, `search_with_filters`, `upload_document`, `update_document`. Arrays make the input schema self-documenting and remove the agent's burden of remembering the separator convention.
 
-4. **Output Structure**: Every search result includes:
-   - **Provenance fields** (`page_number`, `section_heading`, `source_document`, `chunk_id`): Enables precise citations like "according to the section 'Introduction' on page 5"
-   - **Multiple scores** (`rrf_score`, `vector_score`, `bm25_score`): Helps agents understand *why* a result ranked high
-   - **Chunk type** (`text` currently, `table`/`image` planned): Allows future adaptation of explanations
+4. **Strict Enums for Small Value Sets**: parameters with a closed set of valid values (`get_document.format`, `list_documents.status`) are typed as `Literal[...]`, producing JSON Schema `enum` constraints. The agent sees the allowed values directly in the schema instead of having to parse them out of the description.
 
-5. **Semantic Grouping**:
+5. **UUID-or-Name Identifiers**: `search_by_document`, `update_document`, `delete_document` all accept either a UUID or the exact document filename. Names are resolved against the current listing, and unresolved names are surfaced explicitly in the response. This removes the common "list → find UUID → call tool" chain the agent would otherwise need.
+
+6. **Output Structure**: every search result includes:
+   - **Provenance fields** (`page_number`, `section_heading`, `source_document`, `chunk_id`): enables citations like "according to the section 'Introduction' on page 5"
+   - **Multiple scores** (`rrf_score`, `vector_score`, `bm25_score`): helps agents understand *why* a result ranked high
+   - **`_filter` block** on scoped searches: reports `matching_doc_count` and any `unresolved_names` so the agent can detect an empty filter set before reading results
+
+7. **Semantic Grouping**:
    - `search` = global search (no filters)
-   - `search_by_tag` = filter by topic/category
-   - `search_by_document` = filter by specific source
-   - This mirrors how humans think: "search everything" → "search compliance docs" → "search this specific policy"
+   - `search_by_tag` = scope by topic/category
+   - `search_by_document` = scope by specific source(s)
+   - `search_with_filters` = combine both in one call
+   - This mirrors how humans think: "search everything" → "search compliance docs" → "search this policy" → "search compliance docs in these two files"
 
-6. **Error Guidance**: Tool descriptions include **when to use** guidance:
-   - `list_tags`: "Use this **when** the user asks 'what topics are covered?' or before filtering by tag"
-   - `search_by_document`: "Use this **when** the user references a specific document by name"
+8. **Destructive-Action Signaling**: `delete_document` description is explicitly marked **"Destructive"** and recommends confirmation with the user before calling — an affordance that helps agents interrupt for human-in-the-loop checks.
+
+9. **Error Guidance**: tool descriptions include **when-to-use** hints:
+   - `list_tags`: use when the user asks "what topics are covered?" or before filtering by tag
+   - `search_by_document`: use when the user references a specific document by name
+   - `search_with_filters`: use when both a domain **and** a document shortlist are known
 
 **What I'd change with more time:**
-- Add `search_with_filters` that combines tag + document + date filters (currently requires chaining tools)
-- Support semantic search within `list_documents` (currently only filters by exact name match)
-- Add `get_chunk_context` to retrieve surrounding chunks (for better context around search hits)
+- Support semantic substring search on `list_documents` (currently case-insensitive name match)
+- Add `get_chunk_context` to retrieve surrounding chunks around a search hit
+- Extend `search_with_filters` with a `date_from` / `date_to` range (needs a backend filter first)
 
 ### Using MCP Tools
 
