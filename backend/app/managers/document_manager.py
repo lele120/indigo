@@ -73,25 +73,25 @@ class DocumentManager:
         """
         document = await self.get_document(document_id)
 
-        # Update name via service
+        # Mutate the already-loaded instance directly — going through the
+        # service would fetch a second ORM instance and leave `document`
+        # with stale attributes, causing MissingGreenlet errors when
+        # Pydantic later tries to lazy-load `updated_at` post-commit.
         if request.name:
-            await self.document_service.update_metadata(
-                document_id,
-                name=request.name
-            )
+            document.name = request.name
 
-        # Update tags via tag service
         if request.tags is not None:
-            # Clear existing tags
             document.tags = []
             await self.db.flush()
 
-            # Add new tags (get_or_create ensures no duplicates)
             for tag_name in request.tags:
                 tag = await self.tag_service.get_or_create(tag_name)
                 document.tags.append(tag)
 
         await self.db.flush()
+        # Refresh so `updated_at` (and any DB-side defaults) are materialised
+        # before the @transactional commit expires the session attributes.
+        await self.db.refresh(document, ["updated_at"])
         logger.info("document_updated", document_id=str(document_id))
 
         return document
